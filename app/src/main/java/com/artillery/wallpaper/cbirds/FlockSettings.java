@@ -12,7 +12,7 @@ final class FlockSettings {
     static final String FLIGHT_SPEED = "flight_speed_percent";
     static final int MIN_FLIGHT_SPEED = 25;
     static final int MAX_FLIGHT_SPEED = 100;
-    static final int DEFAULT_FLIGHT_SPEED = 50;
+    static final int DEFAULT_FLIGHT_SPEED = 25;
 
     private FlockSettings() {}
 
