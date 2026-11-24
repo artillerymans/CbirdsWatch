@@ -212,7 +212,12 @@ static const double GLIDE_SECONDS_MIN = 0.4, GLIDE_SECONDS_MAX = 1.2;
 /* How the far layer differs from the near: smaller, slower — the parallax — and
  * dimmed toward the ground, which is what distance does to colour. */
 static const double FAR_SHARE = 0.35;
+#ifdef CBIRDS_WALLPAPER
+/* The dimmer layer is for flying past the clock at the same scale. */
+static const double FAR_SIZE = 1.0;
+#else
 static const double FAR_SIZE = 0.62;
+#endif
 static const double FAR_PACE = 0.72;
 static const double FAR_DIM = 0.40; /* How far toward the ground its tint goes. */
 /* What a wing at each phase does to the span: seen from above, a beat is the
@@ -3504,6 +3509,10 @@ static void read_bird_position(const void *context, int index, double *x, double
     *y = birds[index].y;
 }
 
+#ifdef CBIRDS_WALLPAPER
+static vector_t wallpaper_chase_vector(const bird_t *birds, int index);
+#endif
+
 static double flock_direction(const bird_t *birds, const spatial_grid_t *grid, int target_index) {
     const bird_t *target = &birds[target_index];
     double want_x, want_y;
@@ -3521,7 +3530,10 @@ static double flock_direction(const bird_t *birds, const spatial_grid_t *grid, i
     vector_t hawk = hawk_vector(target);
     vector_t wind = wind_vector();
     vector_t keep_out = sign_keep_out_vector(target);
-    vector_t orbit = sign_orbit_vector(target);
+    vector_t flight = sign_orbit_vector(target);
+#ifdef CBIRDS_WALLPAPER
+    flight = wallpaper_chase_vector(birds, target_index);
+#endif
     int neighbors = 0, strangers = 0;
     double kin = 0; /* Counted in kinship: a whole bird for its own flock. */
     int center_x, center_y;
@@ -3603,19 +3615,19 @@ static double flock_direction(const bird_t *birds, const spatial_grid_t *grid, i
         double x = separation.x * config.separation + alignment.x * config.alignment +
                    cohesion.x * COHESION_W + boundary.x * config.boundary + leash.x * LEASH_WEIGHT +
                    pointer.x * MOUSE_WEIGHT + hawk.x * HAWK_WEIGHT + wind.x * WIND_WEIGHT +
-                   wary.x * config.avoid_weight + keep_out.x * SIGN_KEEP_OUT_WEIGHT + orbit.x;
+                   wary.x * config.avoid_weight + keep_out.x * SIGN_KEEP_OUT_WEIGHT + flight.x;
         double y = separation.y * config.separation + alignment.y * config.alignment +
                    cohesion.y * COHESION_W + boundary.y * config.boundary + leash.y * LEASH_WEIGHT +
                    pointer.y * MOUSE_WEIGHT + hawk.y * HAWK_WEIGHT + wind.y * WIND_WEIGHT +
-                   wary.y * config.avoid_weight + keep_out.y * SIGN_KEEP_OUT_WEIGHT + orbit.y;
+                   wary.y * config.avoid_weight + keep_out.y * SIGN_KEEP_OUT_WEIGHT + flight.y;
         return x == 0 && y == 0 ? target->direction : normalized_angle(y, x);
     }
     boundary.x = boundary.x * config.boundary + leash.x * LEASH_WEIGHT + pointer.x * MOUSE_WEIGHT +
                  hawk.x * HAWK_WEIGHT + wind.x * WIND_WEIGHT + keep_out.x * SIGN_KEEP_OUT_WEIGHT +
-                 orbit.x;
+                 flight.x;
     boundary.y = boundary.y * config.boundary + leash.y * LEASH_WEIGHT + pointer.y * MOUSE_WEIGHT +
                  hawk.y * HAWK_WEIGHT + wind.y * WIND_WEIGHT + keep_out.y * SIGN_KEEP_OUT_WEIGHT +
-                 orbit.y;
+                 flight.y;
     if (boundary.x != 0 || boundary.y != 0) {
         double x = cos(target->direction) + boundary.x;
         double y = sin(target->direction) + boundary.y;

@@ -1,8 +1,8 @@
 # CbirdsWatch
 
-Android 9（API 28）动态壁纸。在设备时间更新时，cbirds 的鸟群会重新排列成 HH:mm。WallpaperService 仅在壁纸可见时安排绘制。
+Android 9（API 28）动态壁纸。鸟群排成 HH:mm:ss，其余的鸟分成三群，跟随各自的领头鸟穿行。壁纸按实际画布的短边居中绘制正方形，鸟形随短边等比缩放。WallpaperService 仅在壁纸可见时安排绘制。
 
-在 Android Studio 中打开项目并选择 JDK 17 作为 Gradle JDK。命令行使用 JDK 17 运行 `./gradlew assembleDebug`。项目使用 SDK 35、NDK 30.0.16248370 和 CMake 4.1.2。生成的 APK 位于 `app/build/outputs/apk/debug/app-debug.apk`，包含 ARM 32 位、ARM 64 位和 x86 库。
+在 Android Studio 中打开项目并选择 JDK 17 作为 Gradle JDK。命令行使用 JDK 17 运行 `./gradlew assembleDebug assembleRelease`。项目使用 SDK 35、NDK 30.0.16248370 和 CMake 4.1.2。生成的 APK 包含 ARM 32 位、ARM 64 位和 x86 库，文件名使用 Gradle 的 `versionName`，例如 `app/build/outputs/apk/debug/CbirdsWatch-v0.1.0-debug.apk` 和 `app/build/outputs/apk/release/CbirdsWatch-v0.1.0-release.apk`。
 
 首次构建需要在项目根目录的 `local.properties` 填写 `sdk.dir` 和本机的 `signing.storeFile`、`signing.storePassword`、`signing.keyAlias`、`signing.keyPassword`。密钥库的相对路径以 `app/` 为基准。
 

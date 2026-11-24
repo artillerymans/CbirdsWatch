@@ -61,4 +61,10 @@ android {
             version '4.1.2'
         }
     }
+
+    applicationVariants.all { variant ->
+        variant.outputs.all { output ->
+            output.outputFileName = "${rootProject.name}-v${variant.versionName}-${variant.name}.apk"
+        }
+    }
 }

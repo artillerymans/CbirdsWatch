@@ -1,11 +1,18 @@
-// Keep the upstream files unchanged. The bridge uses the same single-frame
-// simulation and pixel composition as cbirds' headless recorder.
+// Reuse the recorder's simulation and drawing with wallpaper-specific steering.
+#define CBIRDS_WALLPAPER
 #define main cbirds_cli_main
 #include "cbirds/boids.c"
 #undef main
+#undef CBIRDS_WALLPAPER
 
 #include <android/bitmap.h>
 #include <jni.h>
+
+typedef struct {
+    int leader;
+    double waypoint_x, waypoint_y;
+    double retarget_at;
+} chase_group_t;
 
 // The framework invokes our engines on the main thread. Preview and home
 // surfaces share the upstream simulation, which uses file-scope state.
@@ -15,8 +22,62 @@ static struct {
     spatial_grid_t grid;
     bird_t *birds;
     bird_t *snapshot;
+    chase_group_t groups[MAX_FLOCKS];
     jlong last_frame_ms;
 } renderer;
+
+static int is_clock_writer(int index) {
+    return formation.writing && formation.slot[index] >= 0;
+}
+
+static void update_chase_leaders(const bird_t *birds) {
+    double arrival = fmin(screen.width, screen.height) * 0.10;
+    for (int group = 0; group < config.flocks; group++) {
+        chase_group_t *chase = &renderer.groups[group];
+        if (chase->leader < 0 || is_clock_writer(chase->leader)) {
+            chase->leader = -1;
+            for (int i = 0; i < config.birds; i++) {
+                if (birds[i].flock == group && !is_clock_writer(i)) {
+                    chase->leader = i;
+                    break;
+                }
+            }
+            chase->retarget_at = 0;
+        }
+        if (chase->leader < 0) continue;
+
+        const bird_t *leader = &birds[chase->leader];
+        double dx = chase->waypoint_x - leader->x;
+        double dy = chase->waypoint_y - leader->y;
+        if (dx * dx + dy * dy <= arrival * arrival || clock_state.seconds >= chase->retarget_at) {
+            chase->waypoint_x = screen.width * (0.08 + 0.84 * random_unit());
+            chase->waypoint_y = screen.height * (0.08 + 0.84 * random_unit());
+            chase->retarget_at = clock_state.seconds + 3.0 + 2.0 * random_unit();
+        }
+    }
+}
+
+static vector_t wallpaper_chase_vector(const bird_t *birds, int index) {
+    const bird_t *bird = &birds[index];
+    const chase_group_t *group = &renderer.groups[bird->flock];
+    if (group->leader < 0) return (vector_t){0, 0};
+
+    double x = group->waypoint_x;
+    double y = group->waypoint_y;
+    double strength = 5.0;
+    double gap = 2.0 * config.bird_size;
+    if (index != group->leader) {
+        const bird_t *leader = &birds[group->leader];
+        trig_entry_t heading = trig_lookup(leader->direction);
+        x = leader->x - gap * heading.cosine;
+        y = leader->y - gap * heading.sine;
+        strength = 3.2;
+    }
+    double dx = x - bird->x;
+    double dy = y - bird->y;
+    double weight = strength / fmax(gap, sqrt(dx * dx + dy * dy));
+    return (vector_t){dx * weight, dy * weight};
+}
 
 static void release_renderer(void) {
     free_sprites(renderer.sprites);
@@ -31,20 +92,24 @@ static void release_renderer(void) {
 
 static int init_renderer(int width, int height, int bird_count) {
     config.birds = bird_count;
+    config.flocks = MAX_FLOCKS;
     config.palette = palette_named("ember");
-    config.bird_size = 0;
     legend_enabled = 0;
     clock_mode = 1;
     the_sign.kind = SIGN_CLOCK;
-    the_sign.seconds = 0;
+    the_sign.seconds = 1;
     the_sign.twelve_hours = 0;
     the_sign.virtual_clock = 0;
     memset(&clock_state, 0, sizeof(clock_state));
+    for (int group = 0; group < config.flocks; group++) {
+        renderer.groups[group] = (chase_group_t){.leader = -1};
+    }
 
     trig_lookup_init();
     apply_notches();
     set_frame_seconds(1.0 / 15.0);
     apply_screen_size(width / DEFAULT_CELL_WIDTH, height / DEFAULT_CELL_HEIGHT, width, height);
+    config.bird_size = sign_bird_size() + 1;
     if (spatial_grid_init(&renderer.grid, SPATIAL_CELL_SIZE) != SPATIAL_GRID_OK ||
         spatial_grid_prepare(&renderer.grid, width, height, config.birds) != SPATIAL_GRID_OK ||
         rasterise_sprites(renderer.sprites) != PNG_OK ||
@@ -79,12 +144,20 @@ static int advance_renderer(jlong uptime_ms, int flight_speed_percent) {
     if (formation.writing && formation.until >= 0 && clock_state.seconds >= formation.until)
         formation_clear();
     sign_advance(renderer.birds);
+    formation.keep_out = 0;
+    update_chase_leaders(renderer.birds);
     maybe_drift();
     memcpy(renderer.snapshot, renderer.birds, (size_t)config.birds * sizeof(*renderer.snapshot));
     if (spatial_grid_build(&renderer.grid, config.birds, read_bird_position, renderer.snapshot) !=
         SPATIAL_GRID_OK) return 0;
     fly(renderer.birds, renderer.snapshot, &renderer.grid);
-    compose_onto(&renderer.canvas, renderer.sprites, renderer.birds, 1);
+    // Paint the fly-through on the dimmer layer so the time reads through it.
+    for (int i = 0; i < config.birds; i++) {
+        renderer.snapshot[i] = renderer.birds[i];
+        if (is_clock_writer(i)) renderer.snapshot[i].shade = sign_shade_for(i);
+        else renderer.snapshot[i].layer = 1;
+    }
+    compose_onto(&renderer.canvas, renderer.sprites, renderer.snapshot, 1);
     renderer.last_frame_ms = uptime_ms;
     return 1;
 }
