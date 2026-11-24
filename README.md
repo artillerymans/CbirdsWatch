@@ -13,4 +13,4 @@ Android 9（API 28）动态壁纸。在设备时间更新时，cbirds 的鸟群�
 原生渲染来源为 [clainstone/cbirds](https://github.com/clainstone/cbirds/tree/4cabce5bfed288aeb2924270851767c2978f7d35)。项目复制了该版本的 C 源码与 MIT LICENSE，并通过 `wallpaper_bridge.c` 接入其离屏渲染。
 
 
-![预览](./Preview_01.png "案例")
+![预览](./Preview_01.gif "案例")
