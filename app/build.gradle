@@ -1,0 +1,64 @@
+plugins {
+    id 'com.android.application' version '8.12.3'
+}
+
+def localProperties = new Properties()
+rootProject.file('local.properties').withInputStream { localProperties.load(it) }
+
+def signingProperty = { name ->
+    def value = localProperties.getProperty("signing.${name}")
+    if (!value) {
+        throw new GradleException("Missing signing.${name} in local.properties")
+    }
+    return value
+}
+
+android {
+    namespace 'com.artillery.wallpaper.cbirds'
+    compileSdk 35
+    ndkVersion '30.0.16248370'
+
+    signingConfigs {
+        debug {
+            storeFile file(signingProperty('storeFile'))
+            storePassword signingProperty('storePassword')
+            keyAlias signingProperty('keyAlias')
+            keyPassword signingProperty('keyPassword')
+        }
+    }
+
+    defaultConfig {
+        applicationId 'com.artillery.wallpaper.cbirds'
+        minSdk 28
+        targetSdk 28
+        versionCode 1
+        versionName '0.1.0'
+
+        ndk {
+            abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86'
+        }
+    }
+
+    buildTypes {
+        release {
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    lint {
+        // This project targets Android 9 for direct installation.
+        warning.add('ExpiredTargetSdkVersion')
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    externalNativeBuild {
+        cmake {
+            path 'src/main/cpp/CMakeLists.txt'
+            version '4.1.2'
+        }
+    }
+}

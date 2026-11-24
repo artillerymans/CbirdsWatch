@@ -1,0 +1,7323 @@
+/* Feature test macros must precede every include. */
+#define _XOPEN_SOURCE 700
+#define _DEFAULT_SOURCE
+#define _DARWIN_C_SOURCE
+
+#include <errno.h>
+#include <fcntl.h>
+#include <langinfo.h>
+#include <limits.h>
+#include <locale.h>
+#include <math.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/select.h>
+#include <sys/time.h>
+#include <termios.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "cells.h"
+#include "font.h"
+#include "gif.h"
+#include "kitty_graphics.h"
+#include "letters.h"
+#include "link.h"
+#include "options.h"
+#include "picture.h"
+#include "png.h"
+#include "sign.h"
+#include "sky3d.h"
+#include "spatial_grid.h"
+#include "sprite_png.h"
+#include "vt.h"
+
+enum {
+    /* Sixty rotations, six degrees apart. It was ninety, and at four degrees a
+     * fifteen pixel bird moves less than a pixel between frames; with wing beats
+     * and a second layer there are four times the images to build, and six
+     * degrees is still smoother than any sprite sheet a game ever shipped. */
+    ROTATION_FRAMES = 60,
+    /* A power of two so a rounded angle wraps with one mask. At 4096 entries the
+     * samples are 0.088 degrees apart, and sine plus cosine as floats occupy one
+     * typical 32 KB L1 data cache. */
+    TRIG_LOOKUP_SIZE = 4096,
+    TRIG_LOOKUP_MASK = TRIG_LOOKUP_SIZE - 1,
+    /* Wings out, wings half, wings folded: three pictures, beaten in a cycle of
+     * four so the flap goes out and back. */
+    WING_PHASES = 3,
+    WING_CYCLE = 4,
+    /* Near and far. A far bird is smaller, dimmer and slower, flocks only with
+     * other far birds, and is drawn underneath: two planes, and the parallax
+     * between them is what makes a flat screen read as a sky with depth in it. */
+    LAYERS = 2,
+    MAX_PALETTE_SHADES = 8,
+    /* Three is as many as a five step ramp can tell apart: at four the two nearest
+     * shades are closer to each other than two birds are wide. */
+    MAX_FLOCKS = 3,
+    MOUSE_REACH = 120, /* Pixels from the pointer within which a bird feels it. */
+    DEFAULT_VISION_NOTCH = 6,
+    DEFAULT_TURNING_NOTCH = 8,
+    /* Only every sixteenth bird leaves one, because a tail behind all of them is
+     * three times the bandwidth for a picture that reads as mud. Fifty comets in
+     * a flock of eight hundred is what says "moving" in a still frame. */
+    TRAIL_EVERY = 4,
+    TRAIL_LENGTH = 3,
+    INTRO_SECONDS = 3,
+    /* Four is as many as the sky holds: past that they overlap each other, crowd
+     * the flock into the edges and stop reading as separate animals. */
+    MAX_HAWKS = 4,
+    HAWK_REACH = 150,
+    HAWK_COMMITMENT_FRAMES = 40, /* Sixty-hertz frames; converted to seconds below. */
+    HAWK_GIVE_UP = 200,          /* Pixels past which a reconsidered chase is dropped. */
+    HAWK_STALK = 340,            /* And how far off it looks for the next bird. */
+    HAWK_PASS_FRAMES = 14,       /* Sixty-hertz frames; converted to seconds below. */
+    HAWK_SPACING = 150,          /* Pixels two hawks try to keep between them. */
+    /* A GIF's delay is in hundredths of a second, so the rates it can express are
+     * 100/1, 100/2, 100/3 and so on. Viewers also clamp anything under two
+     * hundredths up to a tenth of a second, which puts the real ceiling at fifty:
+     * sixty is simply not a rate a GIF has. */
+    MAX_RECORD_FPS = 50,
+    AUTOPILOT_PERIOD = 4, /* Seconds between one slider moving and the next. */
+    OUTRO_FRAMES_AT_SIXTY = 40,
+    FRAME_ANGLE = 360 / ROTATION_FRAMES,
+    SPRITE_SUPERSAMPLE = 6,
+    SPRITE_WORK_MAX = 256,
+    MIN_BIRD_SIZE = 4,
+    MAX_BIRD_SIZE = 64,
+    MAX_BIRDS = 4096,
+    INPUT_BUFFER_SIZE = 100,
+    DEFAULT_COLS = 80,
+    DEFAULT_ROWS = 24,
+    DEFAULT_CELL_WIDTH = 8,
+    DEFAULT_CELL_HEIGHT = 16,
+    /* Edge bands the flock turns away from, as a fraction of the viewport: a
+     * third on the sides and the top, half of that at the bottom. */
+    TURN_BAND_DIVISOR = 3,
+    BOTTOM_BAND_DIVISOR = 6,
+    /* Sixty is the rate, not a setting: every speed and turn in the program is a
+     * per second quantity divided by it, and a picture a frame terminal is the
+     * one thing that lowers it. A cast may be recorded at up to twice that. */
+    FRAME_RATE = 60,
+    MAX_CAST_FPS = 120,
+    DEFAULT_SPEED = 40,
+    DEFAULT_BIRD_SIZE = 30,
+    /* In three dimensions there are more birds, and they are further off. What
+     * --size means there is the bird at the middle of the flock's depth; the
+     * nearest size is three fifths bigger than that and the farthest a little over
+     * half of it. */
+    SKY_BIRDS = 2000,
+    SKY_BIRD_SIZE = 8,
+    /* Dots are coarser than sprites: a bird that a sprite renders in eight pixels
+     * lights as many dots as one of five, and the flock's depth shows in how thick
+     * the dots lie, which a smaller bird leaves room for. */
+    SKY_TEXT_BIRD_SIZE = 5,
+    /* How a bird is drawn at its distance: its body foreshortened or not, and its
+     * wings spread, half spread or edge on. A bird seen from the side of its
+     * flight is a long thin thing, and head on a short wide one. */
+    SKY_ALONG_LEVELS = 2,
+    SKY_ACROSS_LEVELS = 3,
+    SKY_SHAPES = SKY_ALONG_LEVELS * SKY_ACROSS_LEVELS,
+    SPATIAL_CELL_SIZE = 12,
+    /* Perception is tuned as a radius in pixels rather than in whole grid cells,
+     * which is what lets it share the twelve notch travel: the cell scan derives
+     * from it, and the distance test was always the exact radius anyway. Sixty
+     * pixels is the five cell ceiling it had before. */
+    MIN_VISION_RADIUS = 12,
+    MAX_VISION_RADIUS = 60,
+    DEFAULT_VISION_RADIUS = 36,
+    MAX_VISION_CELLS = MAX_VISION_RADIUS / SPATIAL_CELL_SIZE,
+    /* The parameter panel, anchored to the top left corner. Its size in cells is
+     * fixed: it follows the longest parameter name and the bar, never the
+     * terminal. Below the minimum viewport it is dropped and the flock keeps
+     * everything; the minimums leave a corridor to the right of the panel and
+     * one underneath it. */
+    LEGEND_COLUMNS = 38,
+    /* Ten rows with one flock; with more there is a slider for how much they
+     * avoid each other, and it only exists when there is somebody to avoid. */
+    LEGEND_ROWS = 10,
+    LEGEND_MAX_ROWS = LEGEND_ROWS + 1,
+    /* One notch a keypress, so this is also the number of steps every parameter
+     * travels through, from its floor to its ceiling. */
+    LEGEND_BAR_CELLS = 12,
+    LEGEND_NAME_WIDTH = 10,
+    LEGEND_VALUE_WIDTH = 5,
+    /* The panel is 38 by 11 cells at most and the flock may not enter it. At the
+     * smallest terminal it used to appear in it covered half the screen, and half
+     * the flock was squeezed off the edges of what was left: it needs to be a
+     * quarter of the room at most, not a half, so it waits for a window it fits
+     * inside. */
+    LEGEND_MIN_COLS = 76,
+    LEGEND_MIN_ROWS = 22,
+    LEGEND_LINE_MAX = 128,
+    SPAWN_ATTEMPTS = 32,
+    /* A linked window says it is full a little before it is, so that the birds
+     * already on their way when it says so still find room. */
+    SKY_HEADROOM = 16,
+    /* And at most this many leave by one edge in a frame, which bounds what a
+     * frame spends on the post however thick the flock is at the door; the rest
+     * go in the next, a frame further out. */
+    SKY_PER_FRAME = 64
+};
+
+/* The same scale as the original bottom edge turn: large enough that it settles
+ * the direction on its own, whatever the flocking terms are doing. */
+static const double LEGEND_PUSH = 100000.0;
+/* How hard an edge pushes once a bird reaches the screen's own edge, against a
+ * flocking sum of one to four. Twelve turns them well inside the band and still
+ * leaves them the whole screen to use; much more and the flock plays in a box. */
+static const double EDGE_FIRM = 12.0;
+/* And how much harder each further band-width of straying costs. */
+static const double ESCAPE_PENALTY = 8.0;
+/* Heavy enough to bend a flock that is busy flocking, light enough that it bends
+ * rather than shatters. */
+static const double MOUSE_WEIGHT = 4.0;
+/* A hawk frightens a bird; it does not get to throw it off the screen. At six
+ * the flee beat the edge even at the screen's own edge, and four birds in fifty
+ * were outside the frame at any moment with four hawks up. */
+static const double HAWK_WEIGHT = 3.0;
+/* A shade slower than the flock when it is only cruising, so it has to dive to
+ * catch anything: a hawk that outruns the birds at rest never has to commit, and
+ * the moment it commits is the moment worth watching. */
+static const double HAWK_SPEED = 0.90;
+/* Sharper than a bird's bank, because a raptor is more agile, but a limit all the
+ * same: without one it turned forty degrees a frame and read as a glitch. A fifth
+ * of a radian looked calm and never caught anything: the turning circle was wider
+ * than the flock, so every miss became a long trip to a wall and back. Half a
+ * radian still only landed one chase in eight; at a whole one it lands half of
+ * them, and the wall is reached a third as often. */
+static const double HAWK_TURN = 1.0;
+/* That is per step at sixty a second. It follows elapsed flight time so the hawk
+ * remains the same animal when frames arrive faster or slower, and when the speed
+ * slider flies everything faster or slower. */
+#define HAWK_TURN_PER_FRAME() (HAWK_TURN * FRAME_RATE * flight_seconds())
+/* At most the distance a bird covers in three sixty-hertz steps. */
+static const double HAWK_LEAD_DISTANCE = DEFAULT_SPEED * 3.0;
+/* Inside the dive it accelerates and stops leading: a bird that flees is only a
+ * tenth slower than a cruising hawk, so without this the chase never closes and
+ * there is no moment to watch. */
+static const double HAWK_DIVE = 90.0;
+/* Wing beats a second, for the birds; a starling manages about eight, and six
+ * reads as effort without reading as panic. A bird glides now and then — wings
+ * out and still for half a second or so — because a flock in which every wing is
+ * always beating looks like a machine. */
+static const double WING_HZ = 6.0;
+static const double GLIDE_CHANCE = 0.06; /* Per beat completed. */
+static const double GLIDE_SECONDS_MIN = 0.4, GLIDE_SECONDS_MAX = 1.2;
+/* How the far layer differs from the near: smaller, slower — the parallax — and
+ * dimmed toward the ground, which is what distance does to colour. */
+static const double FAR_SHARE = 0.35;
+static const double FAR_SIZE = 0.62;
+static const double FAR_PACE = 0.72;
+static const double FAR_DIM = 0.40; /* How far toward the ground its tint goes. */
+/* What a wing at each phase does to the span: seen from above, a beat is the
+ * wings foreshortening, not a new drawing. */
+static const double WING_SPAN[WING_PHASES] = {1.0, 0.72, 0.45};
+static const int WING_SEQUENCE[WING_CYCLE] = {0, 1, 2, 1};
+/* Tails: three ghosts behind every fourth bird, each fainter and a touch smaller
+ * than the last, so a tail is a fade and not a queue. */
+static const double TRAIL_ALPHA[TRAIL_LENGTH] = {0.40, 0.25, 0.12};
+static const double TRAIL_SIZE = 0.85;
+static const double HAWK_DIVE_SPEED = 1.45;
+/* How much of the flee is sideways rather than straight away. Purely radial and
+ * the flock bursts like a firework and is gone; with a curl to it the birds peel
+ * around the hawk and close up behind, which is the shape people watch for. */
+static const double HAWK_SWIRL = 0.9;
+/* What one hawk's company is worth to another, against a chase of one. */
+static const double HAWK_APART = 1.2;
+/* And what a wall is worth: more than the chase, or it follows a bird into the
+ * edge and bounces off it. */
+static const double HAWK_WALL = 2.5;
+/* How firmly a hawk is turned from the text of a sign (see hawk_sign_vector). */
+static const double HAWK_SIGN = 0.75;
+/* Flocking is local — a bird sees sixty pixels at most — so nothing in the three
+ * rules keeps a flock together as a body across a whole screen. The leash is the
+ * missing long range term: nothing at all within a flock's own width of its
+ * centre, and a pull that grows outside it. The width grows with the flock, as
+ * the square root of its birds, twelve pixels to the root, which is about the
+ * width a flock that size takes up with no leash at all. A fixed 150 was
+ * narrower than a flock of five hundred, so the leash pulled on its whole rim
+ * and it wound itself into a mill: 1000 birds in two flocks turned 37 times a
+ * minute, 4096 in three 45 times. With the width grown they turn two to four. */
+static const int FLOCK_LEASH = 150; /* The narrowest it gets, for a small flock. */
+static const double LEASH_PER_ROOT_BIRD = 12.0;
+static const double LEASH_WEIGHT = 2.5;
+/* A breeze the whole flock leans into. Enough to shape it, not enough to carry
+ * it off: at the top notch it is about a third of the alignment weight. */
+static const double WIND_WEIGHT = 0.5;
+
+/* Needed in the config initializer, so macros rather than constants. */
+#define DEFAULT_SEPARATION_W 0.005
+#define DEFAULT_ALIGNMENT_W 1.5
+/* Not a slider any more. Dragging it from end to end moved the flock's own
+ * measure of itself — neighbours within sixty pixels — by four and a half, where
+ * simply removing the term moves it by eleven: the force does something, the
+ * knob did not, and it was costing a row of a six row panel and two of the
+ * fourteen keys. */
+#define COHESION_W 0.01
+#define DEFAULT_BOUNDARY_W 0.2
+
+static const double BOUNDARY_MIN = 0.01;
+static const double SEPARATION_MIN = 0.001;
+static const double ALIGNMENT_MIN = 0.1;
+
+/* Each ceiling is placed so that the default lands exactly on the fourth of
+ * twelve notches, a third along the bar. There are no step constants any more:
+ * a step is one notch, which is a twelfth of the travel by construction, and
+ * that is what makes a keypress worth exactly one cell of bar. */
+#define DEFAULT_NOTCH 4
+#define NOTCH_CEILING(minimum, default_value) ((minimum) + 3 * ((default_value) - (minimum)))
+static const double BOUNDARY_MAX = NOTCH_CEILING(0.01, DEFAULT_BOUNDARY_W);
+static const double SEPARATION_MAX = NOTCH_CEILING(0.001, DEFAULT_SEPARATION_W);
+static const double ALIGNMENT_MAX = NOTCH_CEILING(0.1, DEFAULT_ALIGNMENT_W);
+
+/* Flight speed, as a factor on the pace everything else was tuned at. It scales
+ * how far a bird flies in a second and, with it, how far it may turn in that
+ * second, so the path a bird traces is the one the edges, the panel and the
+ * hawks were tuned on, flown faster or slower: without the turn a fast flock
+ * swung wide into the edges and a slow one spun on the spot. A fifth of the pace
+ * is slow motion; at the top a frame is flown in three steps (see fly), which
+ * keeps eight hundred birds near a millisecond a frame. A fifth a notch, from a
+ * fifth at notch zero to thirteen fifths at the top, so the panel prints each
+ * one as it is. The default is the second notch, two fifths: the flock starts
+ * slow enough to follow one bird with the eye, and v/V is there for more. */
+#define DEFAULT_PACE_NOTCH 1
+#define DEFAULT_PACE 0.4
+static const double PACE_STEP = 0.2;
+
+/* How much one flock avoids another, with two or more of them.
+ *
+ * On the fourth notch, the default, a flock keeps to its own kind and to nothing
+ * else: it flies where it likes, and meets and crosses the others. It used to be
+ * sent a room away from them as well, to a home of its own, and a flock sent
+ * home flies round it: two flocks turned twelve times a minute where one flock
+ * alone turns twice. Measured over six runs of a minute and a half.
+ *
+ * Below it the others become kin by halves, a half a notch, until at the bottom
+ * a bird aligns with and closes on every bird it sees: one flock in two or three
+ * colours, each bird's nearest neighbour a stranger as often as chance says. The
+ * leash that keeps a flock together and the pace that tells flocks apart let go
+ * with it, or the colours sort themselves out again.
+ *
+ * Above it each flock is sent a room away from the others, up to twice the room
+ * it used to keep, and a bird steers away from the strangers it can see, which
+ * is what makes two flocks that meet part around each other rather than pass
+ * through. At the top a stranger in sight weighs what the flock's own heading
+ * does by default. The panel shows the whole bar as a factor, a quarter a notch. */
+static const double AVOID_WEIGHT_MAX = 1.5;
+
+#define ALT_SCREEN_ON "\033[?1049h"
+#define ALT_SCREEN_OFF "\033[?1049l"
+#define CURSOR_HIDE "\033[?25l"
+#define CURSOR_SHOW "\033[?25h"
+#define SYNC_UPDATE_END "\033[?2026l"
+/* Any event tracking plus SGR coordinates: 1003 reports plain motion as well as
+ * clicks, and 1006 lifts the 223 column ceiling of the original encoding. */
+#define MOUSE_REPORT_ON "\033[?1003h\033[?1006h"
+#define MOUSE_REPORT_OFF "\033[?1006l\033[?1003l"
+#define KITTY_FREE_IMAGES "\033_Ga=d,d=A,q=2\033\\"
+
+typedef struct {
+    double x, y;
+} vector_t;
+
+typedef struct {
+    float cosine, sine;
+} trig_entry_t;
+
+static trig_entry_t trig_lookup_table[TRIG_LOOKUP_SIZE];
+
+/* Built once before any flock is run. The simulation keeps its continuous
+ * double direction; only the unit vector read hundreds of thousands of times by
+ * the neighbour loop is rounded to the nearest table entry. */
+static void trig_lookup_init(void) {
+    for (int i = 0; i < TRIG_LOOKUP_SIZE; i++) {
+        double angle = (double)i * 2 * M_PI / TRIG_LOOKUP_SIZE;
+        trig_lookup_table[i].cosine = (float)cos(angle);
+        trig_lookup_table[i].sine = (float)sin(angle);
+    }
+}
+
+static trig_entry_t trig_lookup(double angle) {
+    double scaled = angle * (TRIG_LOOKUP_SIZE / (2 * M_PI));
+    int nearest = (int)(scaled + (scaled >= 0 ? 0.5 : -0.5));
+    return trig_lookup_table[(unsigned)nearest & TRIG_LOOKUP_MASK];
+}
+
+typedef struct {
+    double x, y, direction;
+    int frame;
+    int shade; /* Index into the palette, and half of the image id. */
+    int flock; /* Which flock it reads: separation ignores this, the rest does not. */
+    int layer; /* Near or far; the two never see each other. */
+    int wing;  /* Where in the beat it is: an index into WING_SEQUENCE. */
+    int shape; /* In three dimensions, which of the shapes of its size it is drawn as. */
+    double wing_clock;
+    double gliding; /* Seconds of wings held out and still. */
+    double trail_x[TRAIL_LENGTH], trail_y[TRAIL_LENGTH];
+    int trail_at, trail_held;
+    double scattered; /* Seconds a bird of a sign stays away from its place. */
+    /* A letter that is at home and not flying: it neither moves nor is seen by the
+     * birds that do. Always zero for a bird. */
+    int perched;
+} bird_t;
+
+typedef struct {
+    uint8_t *data;
+    size_t length;
+} image_frame_t;
+
+typedef struct {
+    int width, height, cols, rows;
+    int cell_width, cell_height, turn_x, turn_y, turn_bottom;
+    int legend_width, legend_height; /* The panel in pixels, zero when there is none. */
+} screen_t;
+
+typedef struct {
+    int birds, bird_size, palette, flocks;
+    int trails, hawks, shape;
+    int turning_notch;
+    double speed;      /* Pixels a bird covers this frame, at the chosen pace. */
+    double base_speed; /* The same at pace one, which is what the way out flies at. */
+    double pace;       /* The speed slider's factor; one is the shipped flock. */
+    int vision_cells, vision_radius, vision_radius_squared;
+    double separation, alignment, boundary;
+    /* Notch positions, zero to LEGEND_BAR_CELLS. These are the state the keys
+     * move; every value above is derived from them, which is what makes one
+     * keypress exactly one notch of bar rather than nearly one. */
+    int boundary_notch, separation_notch, alignment_notch;
+    int vision_notch, pace_notch;
+    int avoid_notch;
+    double avoid_kinship; /* How much of kin a stranger is: one at the bottom, then halves. */
+    double avoid_room;    /* The room between flock homes, as a share of 2 * FLOCK_LEASH. */
+    double avoid_weight;  /* And the weight of a bird's wariness of strangers. */
+} config_t;
+
+static config_t config = {
+    .birds = 800,
+    .speed = DEFAULT_SPEED,
+    .base_speed = DEFAULT_SPEED,
+    .pace = DEFAULT_PACE,
+    .bird_size = 0, /* not given: settle_the_bird_size makes it 30 */
+    .palette = 0,
+    .flocks = 1,
+    .turning_notch = DEFAULT_TURNING_NOTCH,
+    .vision_cells = DEFAULT_VISION_RADIUS / SPATIAL_CELL_SIZE,
+    .vision_radius = DEFAULT_VISION_RADIUS,
+    .vision_radius_squared = DEFAULT_VISION_RADIUS * DEFAULT_VISION_RADIUS,
+    .separation = DEFAULT_SEPARATION_W,
+    .alignment = DEFAULT_ALIGNMENT_W,
+    .boundary = DEFAULT_BOUNDARY_W,
+    .boundary_notch = DEFAULT_NOTCH,
+    .separation_notch = DEFAULT_NOTCH,
+    .alignment_notch = DEFAULT_NOTCH,
+    /* Twelve to sixty pixels in steps of four: thirty six is the sixth notch. */
+    .vision_notch = DEFAULT_VISION_NOTCH,
+    .pace_notch = DEFAULT_PACE_NOTCH,
+    .avoid_notch = DEFAULT_NOTCH,
+};
+static screen_t screen;
+static int legend_enabled; /* Hidden until --panel or h asks for it. */
+/*
+ * How the frame reaches the screen.
+ *
+ * Braille, in every terminal, unless asked otherwise: the frame is rendered to
+ * pixels exactly as it is for a recording, and the pixels are read back as
+ * braille — eight dots a cell, the finest thing text can do — or as sextants or
+ * half blocks, each cell in the colour of the bird in it. Kitty's graphics
+ * protocol draws real sprites, and only when --render kitty asks for it: Kitty
+ * and Ghostty place them right, and elsewhere what it does is undefined. Other
+ * terminals answer for the protocol and then place nothing, too few birds or
+ * the wrong ones, so no terminal is guessed at.
+ */
+typedef enum {
+    RENDER_UNSET = -1, /* Not asked for: braille live, sprites in a recording. */
+    RENDER_KITTY,
+    RENDER_BRAILLE,
+    RENDER_SEXTANTS, /* Solid two by three blocks: bolder than dots, needs a 2020 font. */
+    RENDER_BLOCKS,
+} render_mode_t;
+static const char *const RENDER_NAMES[] = {"kitty", "braille", "sextants", "blocks", NULL};
+static int render_mode = RENDER_UNSET;
+/* --depth: a second plane of birds further off. The default is the one. */
+static int deep_look;
+/* Text as the flock: --text, or text piped in. The letters are the birds, one for
+ * each, and letters.c holds what is about text. */
+static const char *text_path;
+static int letters_mode;
+static letters_t the_letters;
+/* The text as it was read, so that it can be laid out again when the window changes
+ * size, and how long the window has been a size the letters are not laid out for. */
+static uint8_t *the_text;
+static size_t the_text_length;
+static double reflow_wait;
+/* A size the text was laid out on and nothing of it showed. The letters stay as they
+ * were, so the screen is still not their size, and without this it would be laid out
+ * again every moment to find the same nothing. */
+static int reflow_empty_cols, reflow_empty_rows;
+/* Where the keys come from, and the terminal's modes are set and queried: the
+ * standard input, unless that is a pipe with text in it, in which case the
+ * controlling terminal. */
+static int input_fd = STDIN_FILENO;
+
+/* --3d: the flock flies in a space and is seen from a camera that orbits its
+ * roost. The birds below are then only what the camera sees of it, one frame at a
+ * time: a place on the screen, which way it points there, and a size. */
+static int sky_mode;
+
+/* What a picture is painted in: the flat sky has two planes, far then near, and
+ * the space has a bin for every size, farthest first. */
+static int layer_count(void) {
+    return sky_mode ? SKY_BINS : LAYERS;
+}
+
+static int layer_in_pass(int pass) {
+    return sky_mode ? pass : LAYERS - 1 - pass;
+}
+
+/* How big a bin's sprite is. The bird at the middle of the flock's depth is the
+ * size that was asked for on a picture 512 pixels high, and the sprites grow with
+ * the picture: the flock is framed to fill it, so on a bigger one the same bird
+ * would be a speck. The height they were built for is kept, because where they
+ * are placed must agree with what they were drawn at, and they are rebuilt only
+ * once the window has settled at another size (fit_the_sprites_to_the_window). */
+static int sky_picture_size;
+
+static int sky_bin_size(int bin) {
+    double picture =
+        sky_picture_size > 0 ? sky_picture_size : sky_picture(screen.width, screen.height);
+    /* No bigger than lets the nearest bird be twice the largest --size: a big --size
+     * on a big window was birds of hundreds of pixels, sprites of hundreds of
+     * megabytes and seconds to build them. Every size comes down with it, so the
+     * depth reads as it did. */
+    double middle = config.bird_size * picture / 512.0;
+    double most = 2.0 * MAX_BIRD_SIZE / sky_bin_scale(SKY_BINS - 1);
+    if (middle > most) middle = most;
+    int size = (int)(middle * sky_bin_scale(bin) + 0.5);
+    return size < MIN_BIRD_SIZE ? MIN_BIRD_SIZE : size;
+}
+
+static int drawing_with_text(void) {
+    return render_mode == RENDER_BRAILLE || render_mode == RENDER_SEXTANTS ||
+           render_mode == RENDER_BLOCKS;
+}
+
+static cells_style_t text_style(void) {
+    if (render_mode == RENDER_SEXTANTS) return CELLS_SEXTANTS;
+    if (render_mode == RENDER_BLOCKS) return CELLS_BLOCKS;
+    return CELLS_BRAILLE;
+}
+
+/* Where the pointer is, in pixels, and whether it has ever been seen. The
+ * terminal reports cells, so the position is the middle of the cell it names:
+ * that is as precise as the protocol gets. */
+static struct {
+    int present;
+    double x, y;
+    double moved_at; /* On the run's clock: a pointer that is still scatters no sign. */
+} mouse;
+
+/* A monotonic clock for everything that animates on its own: the frame counter
+ * for anything that wants to act every so many frames, the seconds for anything
+ * that has to look the same whatever the frame rate. */
+static struct {
+    long frame;
+    double seconds;
+} clock_state;
+
+/* How much real or recorded time the next simulation step represents. A normal
+ * live frame is about 1/60 s, a picture renderer about 1/30 s, and an unlocked
+ * frame whatever elapsed since the previous one. */
+static double frame_seconds = 1.0 / FRAME_RATE;
+
+/* How much flying the next step represents: the frame's time at the pace the
+ * speed slider asks for. What a bird or a hawk covers, what it may turn through
+ * and how long a hawk holds a chase run on this. The wing beats, the clocks and
+ * the way out run on the frame's own time: six beats a second reads as effort
+ * at any speed, and at two and a half times it would strobe. */
+static double flight_seconds(void) {
+    return frame_seconds * config.pace;
+}
+
+/* Paused holds the simulation still but keeps drawing and reading keys, so the
+ * panel still answers and a single step is possible. Stepping is one frame of
+ * motion granted while paused. */
+static int paused;
+static int step_once;
+static int population_changed;
+/* Whether the panel is currently on screen. The panel is anchored at the origin
+ * and constant in cells, so it never leaves text behind by moving: the only row
+ * ever needing an erase is one it occupied before being switched off. Clearing
+ * the whole screen would take the uploaded sprites with it. */
+static int legend_drawn;
+static struct termios saved_termios;
+static volatile sig_atomic_t terminal_is_raw;
+static volatile sig_atomic_t terminal_restored;
+static volatile sig_atomic_t alt_screen_is_on;
+static volatile sig_atomic_t sprites_uploaded;
+
+/*
+ * One sky, shared (--link).
+ *
+ * The window joins a row of them, and where a neighbour stands behind an edge the
+ * edge is a door: no band pushes the flock back from it, and a bird or a hawk
+ * that flies out is posted to the neighbour, to fly in by the facing edge. The
+ * flags are all zero unless the neighbour is there and has said it has room, so
+ * that every edge is the wall it always was, and a run without --link never
+ * looks at any of this.
+ */
+static int share_the_sky;
+static link_t the_row;
+static struct {
+    int left, right;           /* For birds. */
+    int hawk_left, hawk_right; /* A hawk needs room of its own. */
+} open_edges;
+
+static void write_all(const void *data, size_t length) {
+    const char *bytes = data;
+    while (length > 0) {
+        ssize_t written = write(STDOUT_FILENO, bytes, length);
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            return;
+        }
+        if (written == 0) return;
+        bytes += written;
+        length -= (size_t)written;
+    }
+}
+
+static void restore_terminal(void) {
+    if (terminal_restored) return;
+    terminal_restored = 1;
+    if (terminal_is_raw) {
+        tcsetattr(input_fd, TCSAFLUSH, &saved_termios);
+        terminal_is_raw = 0;
+    }
+    if (!alt_screen_is_on) return; /* The probe failed before we took the screen. */
+    /* The sprites were uploaded once and outlive the frames that placed them:
+     * the lowercase delete every frame sends clears placements only. Uppercase
+     * frees every image left without one, so the terminal is not holding a few
+     * megabytes of birds after they have flown. */
+    if (sprites_uploaded) write_all(KITTY_FREE_IMAGES, sizeof(KITTY_FREE_IMAGES) - 1);
+    write_all(MOUSE_REPORT_OFF, sizeof(MOUSE_REPORT_OFF) - 1);
+    write_all(SYNC_UPDATE_END, sizeof(SYNC_UPDATE_END) - 1);
+    write_all(CURSOR_SHOW, sizeof(CURSOR_SHOW) - 1);
+    write_all(ALT_SCREEN_OFF, sizeof(ALT_SCREEN_OFF) - 1);
+}
+
+/* The run ends on an error found after the terminal was taken, and the person is
+ * told why on the terminal they had: the screen is given back first. On the
+ * alternate screen, with output processing off, a message is thrown away with the
+ * screen or staircases across it, and nobody reads why the program stopped. The
+ * arguments are worked out before the terminal is touched, so an errno they report
+ * is the one that was set. */
+static void leave_saying(const char *format, ...) {
+    restore_terminal();
+    va_list arguments;
+    va_start(arguments, format);
+    vfprintf(stderr, format, arguments);
+    va_end(arguments);
+    exit(EXIT_FAILURE);
+}
+
+static void signal_handler(int signal_number) {
+    /* The socket first, which is an unlink and a close and so cannot wait for
+     * anything, where putting the terminal back can: tcsetattr drains the output,
+     * and a terminal that has stopped reading holds it there while the window is
+     * still in the sky. */
+    link_close(&the_row);
+    restore_terminal();
+    _exit(128 + signal_number);
+}
+
+static void install_signal_handlers(void) {
+    static const int signals[] = {SIGINT,  SIGTERM, SIGHUP, SIGQUIT,
+                                  SIGSEGV, SIGFPE,  SIGBUS, SIGABRT};
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = signal_handler;
+    action.sa_flags = (int)SA_RESETHAND;
+    sigemptyset(&action.sa_mask);
+    for (size_t i = 0; i < sizeof(signals) / sizeof(*signals); i++)
+        sigaction(signals[i], &action, NULL);
+    /* A reader that goes away, as head does, is an error to report rather than a
+     * death: SIGPIPE's default kills the process before the terminal is put back,
+     * and leaves the shell without echo. Ignored, the write fails with EPIPE and
+     * the program leaves through exit, which restores it. */
+    action.sa_handler = SIG_IGN;
+    action.sa_flags = 0;
+    sigaction(SIGPIPE, &action, NULL);
+}
+
+/*
+ * The terminal's replies, and the key reader that must not take them for keys.
+ *
+ * A question to the terminal is answered with an escape sequence, and what makes
+ * the answer whole depends on the kind of sequence it is: an OSC string ends at a
+ * bell or at ST (ESC \), a DCS at ST, a CSI at its final byte. It does not end at
+ * a letter inside it: the colour cc in rgb:cc/00/00 is a 'c', and a reply that was
+ * cut off there lost its colour. The same goes for the key reader, which has to
+ * know where a string ends to leave it alone, since a reply that came late is
+ * read there, and the letters in it are commands.
+ */
+typedef enum { REPLY_NONE, REPLY_PARTIAL, REPLY_COMPLETE } reply_progress_t;
+
+/* The first reply in `bytes`: where its escape is, where it ends, and which kind of
+ * sequence it is (the byte after the escape). Anything before the escape is a key
+ * that was typed while the question was out. */
+static reply_progress_t read_a_reply(const char *bytes, size_t length, size_t *first, size_t *last,
+                                     char *kind) {
+    size_t at = 0;
+    while (at < length && bytes[at] != '\033') at++;
+    if (at >= length) return REPLY_NONE;
+    *first = at;
+    if (at + 1 >= length) return REPLY_PARTIAL;
+    *kind = bytes[at + 1];
+    if (*kind == '[') {
+        for (size_t i = at + 2; i < length; i++)
+            if ((unsigned char)bytes[i] >= 0x40 && (unsigned char)bytes[i] <= 0x7e) {
+                *last = i + 1;
+                return REPLY_COMPLETE;
+            }
+        return REPLY_PARTIAL;
+    }
+    if (*kind == ']' || *kind == 'P') {
+        for (size_t i = at + 2; i < length; i++) {
+            if (bytes[i] == '\a' && *kind == ']') {
+                *last = i + 1;
+                return REPLY_COMPLETE;
+            }
+            if (bytes[i] != '\033') continue;
+            if (i + 1 >= length) return REPLY_PARTIAL;
+            if (bytes[i + 1] == '\\') {
+                *last = i + 2;
+                return REPLY_COMPLETE;
+            }
+        }
+        return REPLY_PARTIAL;
+    }
+    *last = at + 2; /* An escape and a byte: a key with alt, and no reply. */
+    return REPLY_COMPLETE;
+}
+
+/* Where the key reader is in what it is reading, kept between reads because a
+ * sequence may be split across them. A string, an OSC or a DCS, is read to its end
+ * and thrown away. It is given up if it runs on past any reply this program asks
+ * for, or if nothing more of it comes for a moment: alt with ] or P begins one too,
+ * and the keys typed after that are not part of it. */
+enum { INPUT_NORMAL, INPUT_ESCAPE, INPUT_SEQUENCE, INPUT_STRING, INPUT_STRING_ESCAPE };
+static int input_state = INPUT_NORMAL;
+static char input_string_kind;
+static size_t input_string_length;
+static struct timespec input_string_at;
+static const size_t INPUT_STRING_LONGEST = 256;
+static const double INPUT_STRING_PATIENCE = 0.25;
+/* When the escape that the lock screen is waiting on came, or nothing at all: a
+ * negative second says there is none to wait for. */
+static struct timespec input_escape_at = {-1, 0};
+
+/* A lock screen past its grace waits to see whether an escape is the Escape key. */
+static void wait_on_an_escape(int goes_at_a_key) {
+    if (goes_at_a_key)
+        clock_gettime(CLOCK_MONOTONIC, &input_escape_at);
+    else
+        input_escape_at.tv_sec = -1;
+}
+
+static void begin_a_string(char kind) {
+    input_state = INPUT_STRING;
+    input_string_kind = kind;
+    input_string_length = 0;
+    clock_gettime(CLOCK_MONOTONIC, &input_string_at);
+}
+
+/* Sends a request and collects the reply to it, or whatever comes back until the
+ * deadline. The colour queries ask the terminal a question it may simply not
+ * answer, and may not hang the startup path waiting for a reply that is never
+ * coming. Raw mode has to be on already, or the reply would be echoed and held
+ * until a newline.
+ *
+ * The reply is the one that answers the question: for a request that names what it
+ * asks (OSC 11, OSC 4 entry 3) a complete reply to another question is a late
+ * answer to an earlier one, and is dropped rather than taken for this. A reply
+ * that has begun and is not all there when the time is up is not an answer, and
+ * the key reader is told to throw away the rest of it when it comes. Returns the
+ * length of the reply, which is all that is in the buffer, or 0. */
+static size_t terminal_query(const char *request, size_t request_length, char *reply,
+                             size_t reply_size, int milliseconds) {
+    struct timespec start, now;
+    size_t length = 0;
+    char wanted[32];
+    size_t wanted_length = 0;
+
+    if (reply_size == 0) return 0;
+    reply[0] = '\0';
+    if (request_length > 2 && request[0] == '\033' && request[1] == ']') {
+        const char *mark = memchr(request, '?', request_length);
+        if (mark != NULL && (size_t)(mark - request) < sizeof(wanted)) {
+            wanted_length = (size_t)(mark - request);
+            memcpy(wanted, request, wanted_length);
+        }
+    }
+    /* The question goes out the way the answer comes back: through the controlling
+     * terminal when that is where the keys are read, since the standard output may
+     * be anywhere. */
+    if (input_fd == STDIN_FILENO) {
+        write_all(request, request_length);
+    } else {
+        const char *bytes = request;
+        size_t left = request_length;
+        while (left > 0) {
+            ssize_t written = write(input_fd, bytes, left);
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) break;
+            bytes += written;
+            left -= (size_t)written;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (;;) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long spent = (now.tv_sec - start.tv_sec) * 1000L + (now.tv_nsec - start.tv_nsec) / 1000000L;
+        if (spent >= milliseconds) break;
+
+        /* select and not poll: macOS's poll does not answer for /dev/tty, which is
+         * where the keys come from when the standard input is a pipe. */
+        fd_set readable;
+        FD_ZERO(&readable);
+        FD_SET(input_fd, &readable);
+        long left = milliseconds - spent;
+        struct timeval timeout = {left / 1000, (left % 1000) * 1000};
+        int ready = select(input_fd + 1, &readable, NULL, NULL, &timeout);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (ready == 0) break;
+
+        ssize_t got = read(input_fd, reply + length, reply_size - 1 - length);
+        if (got <= 0) break;
+        length += (size_t)got;
+        reply[length] = '\0';
+        size_t first, last;
+        char kind = 0;
+        while (read_a_reply(reply, length, &first, &last, &kind) == REPLY_COMPLETE) {
+            if (wanted_length == 0 || (last - first >= wanted_length &&
+                                       memcmp(reply + first, wanted, wanted_length) == 0)) {
+                memmove(reply, reply + first, last - first);
+                length = last - first;
+                reply[length] = '\0';
+                return length;
+            }
+            memmove(reply, reply + last, length - last);
+            length -= last;
+            reply[length] = '\0';
+        }
+        if (length + 1 >= reply_size) break;
+    }
+    size_t first, last;
+    char kind = 0;
+    if (read_a_reply(reply, length, &first, &last, &kind) == REPLY_PARTIAL && first + 1 < length &&
+        (kind == ']' || kind == 'P'))
+        begin_a_string(kind);
+    reply[0] = '\0';
+    return 0;
+}
+
+/* What a live run draws with: braille unless something else was asked for. */
+static int live_render_mode(void) {
+    /* Letters are text: --render kitty draws sprites, and a letter has none. */
+    if (letters_mode) return RENDER_BRAILLE;
+    return render_mode == RENDER_UNSET ? RENDER_BRAILLE : render_mode;
+}
+
+static void enter_alt_screen(void) {
+    write_all(ALT_SCREEN_ON, sizeof(ALT_SCREEN_ON) - 1);
+    write_all(CURSOR_HIDE, sizeof(CURSOR_HIDE) - 1);
+    write_all(MOUSE_REPORT_ON, sizeof(MOUSE_REPORT_ON) - 1);
+    alt_screen_is_on = 1;
+}
+
+static int enter_terminal(void) {
+    struct termios raw;
+    if (tcgetattr(input_fd, &raw) < 0) return -1;
+    saved_termios = raw;
+    raw.c_iflag &= (tcflag_t) ~(tcflag_t)(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+    raw.c_oflag &= (tcflag_t) ~(tcflag_t)OPOST;
+    raw.c_cflag |= CS8;
+    raw.c_lflag &= (tcflag_t) ~(tcflag_t)(ECHO | ICANON | IEXTEN);
+    raw.c_cc[VSUSP] = _POSIX_VDISABLE;
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+    if (tcsetattr(input_fd, TCSAFLUSH, &raw) < 0) return -1;
+    terminal_is_raw = 1;
+    return 0;
+}
+
+/* Kept proportional to the viewport: a fixed pixel distance covers a short
+ * terminal entirely and pins the whole flock against one edge. */
+static void update_turn_distances(void) {
+    screen.turn_x = screen.width / TURN_BAND_DIVISOR;
+    screen.turn_y = screen.height / TURN_BAND_DIVISOR;
+    screen.turn_bottom = screen.height / BOTTOM_BAND_DIVISOR;
+    if (screen.turn_x < 1) screen.turn_x = 1;
+    if (screen.turn_y < 1) screen.turn_y = 1;
+    if (screen.turn_bottom < 1) screen.turn_bottom = 1;
+}
+
+/* The panel takes a corner rather than a row, so the flyable area stays an L and
+ * no other derivation has to shrink: the flock keeps the full width below the
+ * panel and the full height beside it, and is kept out of the corner by a force
+ * instead of by a bound. */
+static int legend_rows(void) {
+    return config.flocks > 1 ? LEGEND_MAX_ROWS : LEGEND_ROWS;
+}
+
+static void measure_legend(void) {
+    screen.legend_width = screen.legend_height = 0;
+    if (!legend_enabled) return;
+    if (screen.cols < LEGEND_MIN_COLS || screen.rows < LEGEND_MIN_ROWS) return;
+    screen.legend_width = LEGEND_COLUMNS * screen.cell_width;
+    screen.legend_height = legend_rows() * screen.cell_height;
+}
+
+/* Split out of the ioctl query so the tests drive the real derivation. */
+/* Defined with the other notch arithmetic; needed here because the step a bird
+ * takes is capped by the size of the screen it is taking it on. */
+static void update_speed(void);
+
+static void apply_screen_size(int cols, int rows, int pixel_width, int pixel_height) {
+    screen.cols = cols > 0 ? cols : DEFAULT_COLS;
+    screen.rows = rows > 0 ? rows : DEFAULT_ROWS;
+    screen.width = pixel_width;
+    screen.height = pixel_height;
+    if (screen.width <= 0 || screen.height <= 0) {
+        screen.width = screen.cols * DEFAULT_CELL_WIDTH;
+        screen.height = screen.rows * DEFAULT_CELL_HEIGHT;
+    }
+    screen.cell_width = screen.width / screen.cols;
+    screen.cell_height = screen.height / screen.rows;
+    if (screen.cell_width < 1) screen.cell_width = 1;
+    if (screen.cell_height < 1) screen.cell_height = 1;
+    /* Before the distances, because the panel's turn zone is the panel grown by
+     * one frame of travel and the frame of travel depends on the screen. */
+    update_speed();
+    measure_legend();
+    update_turn_distances();
+}
+
+static void update_screen_dimensions(void) {
+    struct winsize size;
+    memset(&size, 0, sizeof(size));
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) < 0) memset(&size, 0, sizeof(size));
+    /* Text is measured in cells, and a cell is eight by sixteen pixels here whatever
+     * it is on this screen: the same letters fly the same way in a window and on a
+     * high density display, in a recording and live. */
+    if (letters_mode) size.ws_xpixel = size.ws_ypixel = 0;
+    apply_screen_size(size.ws_col, size.ws_row, size.ws_xpixel, size.ws_ypixel);
+}
+
+/*
+ * The terminal's own colours, asked for rather than guessed.
+ *
+ * OSC 4 names a palette entry, OSC 10 and 11 the foreground and background. The
+ * answer comes back as rgb:RRRR/GGGG/BBBB, usually four hex digits a channel, and
+ * a terminal that does not implement the query simply says nothing. A ramp is then
+ * built between the most saturated answer and the background, which is what
+ * makes a screenshot match the poster's own setup: the single thing that decides
+ * whether a terminal toy looks native or looks imported.
+ */
+static uint8_t theme_tints[5][3];
+static int theme_is_known;
+
+static int hex_digit(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* An X colour: one to four hex digits a channel, each its own count, which X
+ * scales to sixteen bits and whose top byte is the colour: two digits are the
+ * byte, four its high half, three the top eight of twelve bits, and one digit
+ * repeated. Four is the usual answer and some terminals send two; one channel read
+ * as the others' width turned a white of one digit black. An rgba: answer has an
+ * alpha after the three, which a colour on a screen does not need. */
+static int parse_osc_colour(const char *reply, uint8_t rgb[3]) {
+    const char *at = strstr(reply, "rgb:");
+    if (at != NULL)
+        at += 4;
+    else if ((at = strstr(reply, "rgba:")) != NULL)
+        at += 5;
+    else
+        return 0;
+    for (int channel = 0; channel < 3; channel++) {
+        unsigned value = 0;
+        int digits = 0;
+        while (digits < 4 && hex_digit(at[digits]) >= 0)
+            value = value * 16 + (unsigned)hex_digit(at[digits++]);
+        if (digits == 0 || hex_digit(at[digits]) >= 0) return 0;
+        rgb[channel] = (uint8_t)(digits == 1   ? value * 17
+                                 : digits == 2 ? value
+                                 : digits == 3 ? value >> 4
+                                               : value >> 8);
+        at += digits;
+        if (channel < 2 && *at++ != '/') return 0;
+    }
+    return 1;
+}
+
+/* How long a colour question waits for its answer: a terminal on the same machine
+ * answers in a millisecond or two, and one that never answers costs no more than
+ * this. The tests, whose terminal is another process on a busy machine, wait
+ * longer. */
+static int colour_reply_milliseconds = 60;
+
+static int ask_colour(const char *request, uint8_t rgb[3]) {
+    char reply[128];
+    if (terminal_query(request, strlen(request), reply, sizeof(reply), colour_reply_milliseconds) ==
+        0)
+        return 0;
+    return parse_osc_colour(reply, rgb);
+}
+
+static int saturation_of(const uint8_t rgb[3]) {
+    int high = rgb[0] > rgb[1] ? rgb[0] : rgb[1];
+    int low = rgb[0] < rgb[1] ? rgb[0] : rgb[1];
+    if (rgb[2] > high) high = rgb[2];
+    if (rgb[2] < low) low = rgb[2];
+    return high - low;
+}
+
+/* The relative luminance the WCAG contrast ratio is built on. Used to keep the
+ * flock off the terminal's own background, which is the one colour a bird must
+ * never be. */
+static double luminance_of(const uint8_t rgb[3]) {
+    double channel[3];
+    for (int c = 0; c < 3; c++) {
+        double v = rgb[c] / 255.0;
+        channel[c] = v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4);
+    }
+    return 0.2126 * channel[0] + 0.7152 * channel[1] + 0.0722 * channel[2];
+}
+
+static double contrast_between(const uint8_t a[3], const uint8_t b[3]) {
+    double high = luminance_of(a), low = luminance_of(b);
+    if (high < low) {
+        double swap = high;
+        high = low;
+        low = swap;
+    }
+    return (high + 0.05) / (low + 0.05);
+}
+
+/* Five steps from the accent towards the background, stopping well short of it.
+ * Over four steps the last shade *was* the background, byte for byte: a fifth of
+ * the flock was painted in the colour of the sky and simply did not exist, and
+ * with three flocks up a whole flock went missing. Over seven, the far end still
+ * reads as distance and the worst case across the common colour schemes keeps a
+ * contrast of 1.8 against the ground instead of 1.0. */
+static void ramp_between(const uint8_t from[3], const uint8_t to[3]) {
+    for (int i = 0; i < 5; i++)
+        for (int c = 0; c < 3; c++)
+            theme_tints[i][c] = (uint8_t)(from[c] + (to[c] - from[c]) * i / 7);
+}
+
+static int learn_the_theme(void) {
+    uint8_t accent[3] = {0, 0, 0}, background[3] = {0, 0, 0};
+    double best = -1;
+
+    /* The background first, because the accent is chosen against it. */
+    if (!ask_colour("\033]11;?\033\\", background)) {
+        /* No background: fade towards black, which is the common case. */
+        background[0] = background[1] = background[2] = 0;
+    }
+    /* Entries one to six are the terminal's own reds through cyans, which is
+     * where a colour scheme keeps its character. The most saturated of them is
+     * not always the one to take: on stock xterm that is pure blue on black,
+     * which is both the dimmest colour on the screen and the ugliest. Saturation
+     * times contrast picks the colour with character that can also be seen. */
+    for (int entry = 1; entry <= 6; entry++) {
+        char request[32];
+        uint8_t rgb[3];
+        snprintf(request, sizeof(request), "\033]4;%d;?\033\\", entry);
+        if (!ask_colour(request, rgb)) continue;
+        double score = saturation_of(rgb) * contrast_between(rgb, background);
+        if (score > best) {
+            best = score;
+            memcpy(accent, rgb, sizeof(accent));
+        }
+    }
+    if (best < 0) return 0;
+    ramp_between(accent, background);
+    theme_is_known = 1;
+    return 1;
+}
+
+/*
+ * Ink: the terminal's own text colour, fading into its own ground.
+ *
+ * A murmuration is a dark shape on a pale sky or a pale one on a dark sky, and
+ * the terminal already says which it is: the foreground is what its text is
+ * written in, the background what it is written on. Five shades from one
+ * towards the other make the flock the terminal's own ink, grey on a black
+ * terminal and near black on a white one, where a fixed ramp is right on only
+ * one of them. It is built at startup, like theme, from OSC 10 and 11, and
+ * kept apart from theme's because the two are different questions: theme wants
+ * the terminal's most colourful colour and ink its plainest.
+ */
+static uint8_t ink_tints[5][3];
+static uint8_t ink_ground[3];
+static int ink_is_known;
+
+/* A tint pulled a share of the way to the ground it is seen against: all that
+ * distance does to a colour, and the one place the arithmetic is written. */
+static void pulled_towards(const uint8_t tint[3], const uint8_t ground[3], double share,
+                           uint8_t out[3]) {
+    for (int c = 0; c < 3; c++) out[c] = (uint8_t)(tint[c] + (ground[c] - tint[c]) * share + 0.5);
+}
+
+/* How far towards the ground the farthest shade goes when the terminal has the
+ * contrast to spare, and the contrast the farthest bird is kept at when it does
+ * not. Ash, which was tuned by eye on a dark ground and ends 0.69 of the way
+ * from white to it, is where the reach comes from; the contrast is the two to
+ * one that the far birds in three dimensions were found to need, because at 1.4
+ * a bird on a terminal is not there at all. */
+static const double INK_REACH = 0.7;
+static const double INK_FAR_CONTRAST = 2.0;
+
+/* `pull` is how far the renderer will dim the farthest bird again on its way to
+ * the ground, and the ramp is cut short until that bird, as it is drawn, still
+ * keeps its contrast: the dimming is why a fixed fraction would not do, and why
+ * a pair with little contrast to begin with gets a short ramp rather than one
+ * that runs into the ground. The loop settles to the nearest hundredth, and
+ * measures the bird as the bytes it is drawn in, so rounding cannot take the
+ * floor away. A terminal whose text has no contrast to spare gets its text colour
+ * five times over, which is a flock with no depth and not one in the background. */
+static void build_the_ink(const uint8_t foreground[3], const uint8_t background[3], double pull) {
+    double reach = INK_REACH;
+    for (;;) {
+        for (int shade = 0; shade < 5; shade++)
+            for (int c = 0; c < 3; c++)
+                ink_tints[shade][c] =
+                    (uint8_t)(foreground[c] + (background[c] - foreground[c]) * reach * shade / 4 +
+                              0.5);
+        uint8_t drawn[3];
+        pulled_towards(ink_tints[4], background, pull, drawn);
+        if (reach <= 0 || contrast_between(drawn, background) >= INK_FAR_CONTRAST) break;
+        reach = reach > 0.01 ? reach - 0.01 : 0;
+    }
+    memcpy(ink_ground, background, sizeof(ink_ground));
+    ink_is_known = 1;
+}
+
+/* Both colours or neither: a ramp from a foreground that was guessed would be
+ * invisible on exactly the terminals that need it. The background is asked first
+ * and a silent terminal costs one wait, not two. A text the colour of its ground
+ * is no text anybody reads, and a flock in it would not be seen: that answer is
+ * taken for no answer. */
+static const double INK_LEAST_CONTRAST = 1.5;
+
+static int learn_the_ink(double pull) {
+    uint8_t foreground[3], background[3];
+    if (!ask_colour("\033]11;?\033\\", background)) return 0;
+    if (!ask_colour("\033]10;?\033\\", foreground)) return 0;
+    if (contrast_between(foreground, background) < INK_LEAST_CONTRAST) return 0;
+    build_the_ink(foreground, background, pull);
+    return 1;
+}
+
+/*
+ * A palette is a list of tints applied to the one embedded sprite. The first
+ * entry of every palette is the sprite untouched, so a bird with no shade of
+ * its own looks exactly as it always did.
+ */
+typedef struct {
+    const char *name;
+    const char *help;
+    int shades;
+    const uint8_t (*tints)[3];
+    png_tint_mode_t mode;
+} palette_t;
+
+static const uint8_t EMBER_TINTS[][3] = {
+    {255, 214, 138}, {255, 176, 66}, {247, 122, 41}, {224, 74, 39}, {173, 44, 51},
+};
+static const uint8_t ICE_TINTS[][3] = {
+    {226, 246, 255}, {160, 220, 250}, {96, 176, 236}, {58, 122, 206}, {44, 74, 158},
+};
+static const uint8_t ACID_TINTS[][3] = {
+    {238, 255, 176}, {186, 244, 96}, {118, 214, 74}, {54, 176, 108}, {26, 122, 106},
+};
+static const uint8_t MATRIX_TINTS[][3] = {
+    {198, 255, 198}, {120, 246, 120}, {54, 210, 70}, {26, 150, 48}, {12, 92, 30},
+};
+static const uint8_t AURORA_TINTS[][3] = {
+    {206, 255, 222}, {110, 240, 170}, {44, 204, 170}, {60, 140, 210}, {110, 84, 200},
+};
+/* A ramp is read in order, not by brightness: one flock is coloured along it by
+ * heading, a shade at a time as a bird turns, and several flocks from its ends
+ * inwards. So prism goes round the rainbow instead of from light to dark, and
+ * potion is two hues that meet with nothing between them. */
+static const uint8_t PRISM_TINTS[][3] = {
+    {255, 92, 92}, {255, 196, 64}, {96, 220, 110}, {80, 160, 255}, {176, 110, 255},
+};
+static const uint8_t POTION_TINTS[][3] = {
+    {170, 255, 110}, {72, 214, 104}, {206, 160, 255}, {160, 104, 240}, {118, 64, 206},
+};
+static const uint8_t DUSK_TINTS[][3] = {
+    {255, 214, 170}, {255, 148, 120}, {232, 86, 136}, {160, 70, 170}, {92, 64, 168},
+};
+static const uint8_t ASH_TINTS[][3] = {
+    {244, 244, 246}, {206, 208, 214}, {164, 168, 178}, {124, 128, 140}, {88, 92, 104},
+};
+static const uint8_t GTA6_TINTS[][3] = {
+    {255, 214, 92}, {255, 150, 64}, {255, 84, 128}, {214, 64, 196}, {124, 72, 230},
+};
+/* What the embedded sprite is actually painted, for the palettes that leave it
+ * alone: a hawk still has to stand off that. */
+static const uint8_t SPRITE_OWN_COLOUR[3] = {237, 28, 36};
+
+static const palette_t PALETTES[] = {
+    {"theme", "the terminal's own colours, asked for at startup", 5,
+     (const uint8_t (*)[3])theme_tints, PNG_TINT_REPLACE},
+    {"ember", "embers, pale gold to deep red", 5, EMBER_TINTS, PNG_TINT_REPLACE},
+    {"ice", "ice, white through to deep blue", 5, ICE_TINTS, PNG_TINT_REPLACE},
+    {"acid", "acid, lime through to teal", 5, ACID_TINTS, PNG_TINT_REPLACE},
+    {"matrix", "the green of the film it is named after", 5, MATRIX_TINTS, PNG_TINT_REPLACE},
+    {"aurora", "the northern lights, mint through to violet", 5, AURORA_TINTS, PNG_TINT_REPLACE},
+    {"prism", "light through a prism, red to violet", 5, PRISM_TINTS, PNG_TINT_REPLACE},
+    {"potion", "two potions that will not mix, green and violet", 5, POTION_TINTS,
+     PNG_TINT_REPLACE},
+    {"dusk", "the sky at dusk, peach through to indigo", 5, DUSK_TINTS, PNG_TINT_REPLACE},
+    {"ash", "ash, white through to slate grey", 5, ASH_TINTS, PNG_TINT_REPLACE},
+    {"gta6", "the sunset of the game it is named after, gold to violet", 5, GTA6_TINTS,
+     PNG_TINT_REPLACE},
+    {"ink", "the terminal's text colour, fading into its background", 5,
+     (const uint8_t (*)[3])ink_tints, PNG_TINT_REPLACE},
+};
+enum { PALETTE_COUNT = sizeof(PALETTES) / sizeof(*PALETTES) };
+
+static const char *PALETTE_NAMES[PALETTE_COUNT + 1];
+
+/* A PNG of somebody's own, if they gave one: it keeps its own colours, which is
+ * the whole reason for drawing one. Every palette replaces the colour it is
+ * given, so the flock used to come out flat ember whatever the artwork was. */
+static const char *sprite_path;
+
+/* --picture: a PNG the flock draws. Its colours, cut down to a ramp of the
+ * program's own kind, are the palette of the run unless --color was given, and
+ * then the picture's light and dark pick shades of that. See the sign, below. */
+static const char *picture_path;
+static png_image_t picture_image;
+static int picture_colours_in_use;
+static int palette_was_asked_for;
+static uint8_t picture_tints[MAX_PALETTE_SHADES][3];
+static palette_t picture_palette = {"picture", "the colours of the picture", 0, NULL,
+                                    PNG_TINT_REPLACE};
+
+/* Named rather than numbered: the table's order is a presentation choice and
+ * should not be load bearing. */
+static int palette_named(const char *name) {
+    for (int i = 0; i < PALETTE_COUNT; i++)
+        if (strcmp(PALETTES[i].name, name) == 0) return i;
+    return 0;
+}
+
+static int palette_follows_the_theme(void) {
+    return !picture_colours_in_use && strcmp(PALETTES[config.palette].name, "theme") == 0;
+}
+
+static int palette_is_ink(void) {
+    return strcmp(PALETTES[config.palette].name, "ink") == 0;
+}
+
+/* Whether the colour of the terminal's ground is known: only ink asks for it. */
+static int the_ground_is_known(void) {
+    return palette_is_ink() && ink_is_known;
+}
+
+#define FALLBACK_PALETTE palette_named("ember")
+/* Where ink goes when there is no terminal to ask, or it does not answer: the
+ * ramp that was the three dimensional default before ink, for a dark ground. */
+#define FALLBACK_INK palette_named("ash")
+
+static void name_the_palettes(void) {
+    for (int i = 0; i < PALETTE_COUNT; i++) PALETTE_NAMES[i] = PALETTES[i].name;
+    PALETTE_NAMES[PALETTE_COUNT] = NULL;
+}
+
+static const palette_t *palette(void) {
+    return picture_colours_in_use ? &picture_palette : &PALETTES[config.palette];
+}
+
+static int palette_shades(void) {
+    if (sprite_path != NULL) return 1; /* One set, untinted, as it was drawn. */
+    return palette()->shades;
+}
+
+/* A hawk is not one of the flock's shades. What has to read instantly is that
+ * this one is different.
+ *
+ * It used to be a dark silhouette, which is what a hawk looks like against the
+ * sky and what nothing looks like against a black terminal: barely a twentieth of
+ * a stop above the background, invisible in every recording. Scarlet fixed that
+ * everywhere except the warm ramps, where scarlet is just another ember — against
+ * ember the contrast was 1.16, which is no contrast at all. So there are three
+ * colours and the palette picks: whichever of them stands furthest from the
+ * nearest thing the flock is wearing. */
+static const uint8_t HAWK_COLOURS[][3] = {
+    {255, 60, 72},   /* Scarlet, for every cold or grey ramp. */
+    {255, 246, 210}, /* A hot near-white, against a dark ramp, or one with red and blue in it. */
+    {96, 226, 255},  /* And an electric cyan, for the ramps that are already fire. */
+};
+enum { HAWK_COLOUR_COUNT = sizeof(HAWK_COLOURS) / sizeof(*HAWK_COLOURS) };
+static const double HAWK_GROUND_CONTRAST = 3.0;
+
+/* How far apart two colours look, which is not how far apart their brightnesses
+ * are: scarlet and pale ice blue are a stone's throw apart by luminance and could
+ * not be more different to look at. The usual weighted RGB distance, good enough
+ * for choosing between two candidates. */
+static double colour_distance(const uint8_t a[3], const uint8_t b[3]) {
+    double mean_red = (a[0] + b[0]) / 2.0;
+    double dr = a[0] - b[0], dg = a[1] - b[1], db = a[2] - b[2];
+    return sqrt((2 + mean_red / 256) * dr * dr + 4 * dg * dg +
+                (2 + (255 - mean_red) / 256) * db * db);
+}
+
+static const uint8_t *hawk_colour(void) {
+    const palette_t *chosen = palette();
+    /* Against artwork nobody has looked at, scarlet and no cleverness. */
+    if (sprite_path != NULL) return HAWK_COLOURS[0];
+    int best = 0;
+    double best_gap = -1;
+    for (int candidate = 0; candidate < HAWK_COLOUR_COUNT; candidate++) {
+        /* A hawk has to be seen against the ground as well as the flock. Only a
+         * ground that was asked for is known, and a white one rules out the near
+         * white and the cyan, which are far from black ink and not from paper. */
+        if (the_ground_is_known() &&
+            contrast_between(HAWK_COLOURS[candidate], ink_ground) < HAWK_GROUND_CONTRAST)
+            continue;
+        double gap = 1e9;
+        for (int shade = 0; shade < chosen->shades; shade++) {
+            const uint8_t *tint = chosen->tints != NULL ? chosen->tints[shade] : SPRITE_OWN_COLOUR;
+            double against = colour_distance(HAWK_COLOURS[candidate], tint);
+            if (against < gap) gap = against;
+        }
+        if (gap > best_gap) {
+            best_gap = gap;
+            best = candidate;
+        }
+    }
+    return HAWK_COLOURS[best];
+}
+
+static void hawk_tint(png_image_t *image) {
+    const uint8_t *colour = hawk_colour();
+    png_tint(image, colour[0], colour[1], colour[2], PNG_TINT_REPLACE);
+}
+
+/* Shade zero of a tinted palette is still a tint: the list is the whole ramp. */
+static void palette_tint(png_image_t *image, int shade) {
+    const palette_t *chosen = palette();
+    if (sprite_path != NULL) return; /* Somebody's own artwork, left alone. */
+    if (chosen->tints == NULL) return;
+    if (shade < 0) shade = 0;
+    if (shade >= chosen->shades) shade = chosen->shades - 1;
+    png_tint(image, chosen->tints[shade][0], chosen->tints[shade][1], chosen->tints[shade][2],
+             chosen->mode);
+}
+
+/* Twice a bird: a hawk has to read as the bigger thing at a glance, at the
+ * largest bird too, which is why its ceiling is twice the bird's. */
+static int hawk_sprite_size(void) {
+    int size = config.bird_size * 2;
+    return size > 2 * MAX_BIRD_SIZE ? 2 * MAX_BIRD_SIZE : size;
+}
+
+/* A bird is drawn from its top left corner; a hawk from its middle, so that the
+ * point the flock flees and the silhouette on the screen are the same place. One
+ * function, because the live frame and the recorder both have to agree. */
+static int hawk_draw_offset(void) {
+    return hawk_sprite_size() / 2;
+}
+
+/* In a space a hawk is three times the bird of its size, whichever it is: it has to
+ * be the thing the eye goes to among two thousand, and the far ones are small. */
+static int hawk_size_in_layer(int layer) {
+    int size = sky_bin_size(layer) * 3;
+    return size > 2 * MAX_BIRD_SIZE ? 2 * MAX_BIRD_SIZE : size;
+}
+
+/*
+ * The bird, or something else.
+ *
+ * A shape is a handful of triangles in a unit square, pointing along +x because
+ * that is what frame zero means, rasterised with four samples a pixel so the
+ * edges survive the rotation and the shrink. Drawing them rather than embedding
+ * them means five more sprites for no more bytes, and the only external file the
+ * program will ever read is one the user chose.
+ */
+typedef struct {
+    double x[3], y[3];
+} triangle_t;
+
+typedef struct {
+    const char *name;
+    int count;
+    const triangle_t *triangles;
+    double roundness; /* Radius of a filled circle to union in, zero for none. */
+} shape_t;
+
+static const triangle_t ARROW_TRIANGLES[] = {
+    {{0.05, 0.95, 0.05}, {0.15, 0.50, 0.85}},
+    {{0.05, 0.45, 0.05}, {0.35, 0.50, 0.65}},
+};
+static const triangle_t PLANE_TRIANGLES[] = {
+    {{0.10, 0.95, 0.10}, {0.44, 0.50, 0.56}}, /* Fuselage. */
+    {{0.30, 0.55, 0.20}, {0.48, 0.50, 0.08}}, /* Upper wing. */
+    {{0.30, 0.55, 0.20}, {0.52, 0.50, 0.92}}, /* Lower wing. */
+    {{0.08, 0.22, 0.08}, {0.30, 0.50, 0.70}}, /* Tail. */
+};
+
+static const shape_t SHAPES[] = {
+    {"bird", 0, NULL, 0.0}, /* The embedded drawing, not a shape at all. */
+    {"arrow", 2, ARROW_TRIANGLES, 0.0},
+    {"plane", 4, PLANE_TRIANGLES, 0.0},
+    {"dot", 0, NULL, 0.40},
+};
+enum { SHAPE_COUNT = sizeof(SHAPES) / sizeof(*SHAPES) };
+static const char *SHAPE_NAMES[SHAPE_COUNT + 1];
+
+static void name_the_shapes(void) {
+    for (int i = 0; i < SHAPE_COUNT; i++) SHAPE_NAMES[i] = SHAPES[i].name;
+    SHAPE_NAMES[SHAPE_COUNT] = NULL;
+}
+
+static int inside_triangle(const triangle_t *t, double x, double y) {
+    double d1 = (x - t->x[1]) * (t->y[0] - t->y[1]) - (t->x[0] - t->x[1]) * (y - t->y[1]);
+    double d2 = (x - t->x[2]) * (t->y[1] - t->y[2]) - (t->x[1] - t->x[2]) * (y - t->y[2]);
+    double d3 = (x - t->x[0]) * (t->y[2] - t->y[0]) - (t->x[2] - t->x[0]) * (y - t->y[0]);
+    return (d1 >= 0 && d2 >= 0 && d3 >= 0) || (d1 <= 0 && d2 <= 0 && d3 <= 0);
+}
+
+static int inside_shape(const shape_t *shape, double x, double y) {
+    if (shape->roundness > 0) {
+        double dx = x - 0.5, dy = y - 0.5;
+        if (dx * dx + dy * dy <= shape->roundness * shape->roundness) return 1;
+    }
+    for (int i = 0; i < shape->count; i++)
+        if (inside_triangle(&shape->triangles[i], x, y)) return 1;
+    return 0;
+}
+
+static png_status_t draw_shape(int which, int size, png_image_t *out) {
+    const shape_t *shape = &SHAPES[which];
+    png_status_t status = png_image_alloc(out, size, size);
+    if (status != PNG_OK) return status;
+
+    for (int py = 0; py < size; py++) {
+        for (int px = 0; px < size; px++) {
+            int hits = 0;
+            /* Four samples a pixel: enough of an edge to survive a rotation and a
+             * shrink, and cheap enough to do once at startup. */
+            for (int sy = 0; sy < 2; sy++)
+                for (int sx = 0; sx < 2; sx++)
+                    hits += inside_shape(shape, (px + 0.25 + sx * 0.5) / size,
+                                         (py + 0.25 + sy * 0.5) / size);
+            uint8_t *pixel = out->pixels + ((size_t)py * (size_t)size + (size_t)px) * 4;
+            pixel[0] = pixel[1] = pixel[2] = 255;
+            pixel[3] = (uint8_t)(hits * 255 / 4);
+        }
+    }
+    return PNG_OK;
+}
+
+static const char *program_name = "cbirds"; /* As invoked, for every message. */
+
+/* A PNG of somebody's own, for a sprite or a picture: up to four megabytes of
+ * it, and every way it can go wrong said as it is. */
+static png_status_t load_png_file(const char *path, const char *what, png_image_t *out) {
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        fprintf(stderr, "%s: cannot open %s\n", program_name, path);
+        exit(EXIT_FAILURE);
+    }
+    static uint8_t buffer[1 << 22]; /* Four megabytes of PNG is a generous bird. */
+    size_t length = fread(buffer, 1, sizeof(buffer), file);
+    /* Said as it is, rather than decoding the first four megabytes and
+     * reporting a truncated file the user knows is whole. */
+    int too_large = length == sizeof(buffer) && fgetc(file) != EOF;
+    int unreadable = ferror(file);
+    fclose(file);
+    if (too_large || unreadable) {
+        if (too_large)
+            fprintf(stderr, "%s: %s is over 4 MB, too large for %s\n", program_name, path, what);
+        else
+            fprintf(stderr, "%s: cannot read %s\n", program_name, path);
+        exit(EXIT_FAILURE);
+    }
+    return png_decode(buffer, length, out);
+}
+
+/* Whichever the user asked for: a PNG of their own, one of the drawn shapes, or
+ * the drawing compiled into the binary. */
+static png_status_t load_sprite(png_image_t *out) {
+    if (sprite_path != NULL) return load_png_file(sprite_path, "a sprite", out);
+    if (config.shape != 0) return draw_shape(config.shape, SPRITE_WORK_MAX, out);
+    return png_decode(sprite_png, sprite_png_len, out);
+}
+
+static int sprite_set_count(void);
+
+/* Kitty draws only what has been uploaded, so every set is encoded to PNG and
+ * sent before the first frame. The images are the very ones the other renderers
+ * read pixels from; nothing is built twice. */
+static kitty_graphics_status_t upload_sprite_sets(kitty_graphics_t *graphics,
+                                                  const png_image_t *frames) {
+    int images = sprite_set_count() * ROTATION_FRAMES;
+    for (int i = 0; i < images; i++) {
+        if (frames[i].pixels == NULL) continue;
+        uint8_t *encoded = NULL;
+        size_t length = 0;
+        if (png_encode(&frames[i], &encoded, &length) != PNG_OK) return KITTY_GRAPHICS_ERR_MEMORY;
+        kitty_graphics_status_t status =
+            kitty_graphics_upload_png(graphics, (uint32_t)i + 1, encoded, length);
+        free(encoded);
+        if (status != KITTY_GRAPHICS_OK) return status;
+    }
+    kitty_graphics_status_t status = kitty_graphics_delete_all_placements(graphics);
+    return status == KITTY_GRAPHICS_OK ? kitty_graphics_flush(graphics) : status;
+}
+
+/*
+ * The flock's own random numbers.
+ *
+ * --seed promises the same flock for the same seed, and rand() cannot keep that:
+ * its sequence belongs to the C library, and glibc, macOS and the BSDs each draw
+ * a different one from the same seed. This is glibc's generator written out, an
+ * additive lagged Fibonacci over 31 words seeded by a Park and Miller LCG and
+ * run 310 steps before its first number. A seed now gives the same flock
+ * everywhere, and every clip recorded on Linux before it existed still comes
+ * out byte for byte.
+ */
+enum { RANDOM_WORDS = 31, RANDOM_LAG = 3, RANDOM_WARMUP = 310, RANDOM_MAX = 2147483647 };
+static struct {
+    uint32_t word[RANDOM_WORDS];
+    int front, rear;
+} random_state;
+
+static uint32_t next_random(void) {
+    uint32_t sum = random_state.word[random_state.front] += random_state.word[random_state.rear];
+    random_state.front = (random_state.front + 1) % RANDOM_WORDS;
+    random_state.rear = (random_state.rear + 1) % RANDOM_WORDS;
+    return sum >> 1; /* The lowest bit is the least random one. */
+}
+
+static void seed_random(unsigned seed) {
+    if (seed == 0) seed = 1;
+    /* glibc holds the seed as a 32 bit signed word; the wrap is spelled out so it
+     * does not rest on how this compiler converts an unsigned that does not fit. */
+    int64_t word = seed > INT32_MAX ? (int64_t)seed - 4294967296 : (int64_t)seed;
+    random_state.word[0] = (uint32_t)seed;
+    for (int i = 1; i < RANDOM_WORDS; i++) {
+        /* 16807 * word % 2147483647 by Schrage's method, as glibc computes it. */
+        int64_t high = word / 127773, low = word % 127773;
+        word = 16807 * low - 2836 * high;
+        if (word < 0) word += 2147483647;
+        random_state.word[i] = (uint32_t)word;
+    }
+    random_state.front = RANDOM_LAG;
+    random_state.rear = 0;
+    for (int i = 0; i < RANDOM_WARMUP; i++) next_random();
+}
+
+static double random_unit(void) {
+    return (double)next_random() / RANDOM_MAX;
+}
+
+static int direction_frame(double radians) {
+    int degrees = (int)(radians * 180.0 / M_PI);
+    return ((degrees % 360 + 360) % 360) / FRAME_ANGLE;
+}
+
+/* Where the force acts: the panel grown by one frame of travel. A bird just
+ * outside this rectangle lands at worst one epsilon inside the panel edge, which
+ * is still outside the panel itself, and by then the push is on. That is what
+ * makes the panel unreachable rather than merely unwelcoming, and the margin
+ * follows the distance covered by this simulation step. */
+static int legend_turn_zone(double x, double y) {
+    /* Over text the panel is a window laid on top of it, not a wall: the letters
+     * under it have homes there, and one that can never land is not a letter. */
+    return !letters_mode && screen.legend_width > 0 && x < screen.legend_width + config.speed &&
+           y < screen.legend_height + config.speed;
+}
+
+/* Out through the nearer of the two open sides. The panel sits in a corner, so
+ * the only ways out are right and down, and the push never aims at a screen
+ * edge. The magnitude settles the direction by itself. */
+static int legend_repels(const bird_t *bird, vector_t *boundary) {
+    if (!legend_turn_zone(bird->x, bird->y)) return 0;
+    double escape_x = screen.legend_width + config.speed - bird->x;
+    double escape_y = screen.legend_height + config.speed - bird->y;
+    if (escape_x <= escape_y)
+        boundary->x = LEGEND_PUSH;
+    else
+        boundary->y = LEGEND_PUSH;
+    return 1;
+}
+
+/* Spread over the region no turn band covers, so no bird starts by fleeing an
+ * edge and the flock does not begin stacked on a single point. */
+/*
+ * The flock writes.
+ *
+ * A target per lit cell of the text, laid out in the rectangle the panel leaves
+ * free, and a bird per target round robin so a cell with several birds on it
+ * reads as a thick stroke. While it is writing, a bird steers at its target and
+ * moves the smaller of its speed and the distance left, which is what lets it
+ * land exactly instead of orbiting: the letters come out crisp and then breathe,
+ * because the flocking terms are still there underneath.
+ *
+ * Targets never fall inside the panel's turn zone, because the force that keeps
+ * birds off the panel is unanswerable and a target in there could never be
+ * reached.
+ */
+/* A target for every bird there can be: a picture sends them all. */
+enum { FORMATION_MAX_TARGETS = MAX_BIRDS };
+
+static struct {
+    int count;
+    double x[FORMATION_MAX_TARGETS];
+    double y[FORMATION_MAX_TARGETS];
+    double until; /* Seconds on the clock at which to let go; negative is never. */
+    int writing;
+    /* What only a sign has (see below). The intro leaves all of it alone, and a
+     * bird of the intro is told by nothing but its number. */
+    int sign;
+    double cell;                                   /* The side of one lit cell of a letter. */
+    double hover;                                  /* How far a bird loops round its place. */
+    int slot[MAX_BIRDS];                           /* A bird's target, or -1 if it flocks on. */
+    double hover_x[MAX_BIRDS], hover_y[MAX_BIRDS]; /* Where in its loop, this frame. */
+    double lift[FORMATION_MAX_TARGETS];    /* One for a target that rises with the breath. */
+    double shift_y[FORMATION_MAX_TARGETS]; /* And how far it has risen, this frame. */
+    int glyph[FORMATION_MAX_TARGETS];      /* Which letter of the text a target is a cell of. */
+    double across[FORMATION_MAX_TARGETS];  /* How far along the text a target is, 0 to 1. */
+    int keep_out;                          /* The rest of the flock stays out of box. */
+    sign_box_t box;
+    double band;
+} formation;
+
+static void formation_clear(void) {
+    formation.count = 0;
+    formation.writing = 0;
+    formation.keep_out = 0;
+}
+
+/* Puts lines of text on the grid of cells, centred in the rectangle, each cell
+ * `cell` pixels on a side; formation.count says how many targets that made. Each
+ * line is centred on the widest. A lone line is laid out exactly as it always
+ * was, to the last bit, because the intro is a lone line and every recording
+ * opens with it. */
+static void formation_place(const char *const *lines, int line_count, double left, double top,
+                            double right, double bottom, double cell, int lift_the_colon) {
+    int columns = 0;
+    for (int l = 0; l < line_count; l++)
+        if (font_text_width(lines[l]) > columns) columns = font_text_width(lines[l]);
+
+    double width = columns * cell, height = sign_rows(line_count) * cell;
+    double origin_x = left + (right - left - width) / 2;
+    double origin_y = top + (bottom - top - height) / 2;
+
+    int letter = 0; /* Counted through all the lines: a clock changes a letter at a time. */
+    for (int l = 0; l < line_count; l++) {
+        double indent = (columns - font_text_width(lines[l])) / 2.0;
+        int column = 0;
+        for (const char *c = lines[l]; *c != '\0'; c++) {
+            const char *glyph = font_glyph(*c);
+            if (glyph == NULL) continue;
+            letter++;
+            for (int row = 0; row < FONT_HEIGHT; row++) {
+                for (int x = 0; x < FONT_WIDTH; x++) {
+                    if (glyph[row * FONT_WIDTH + x] != '#') continue;
+                    if (formation.count >= FORMATION_MAX_TARGETS) break;
+                    double px = origin_x + (indent + column + x + 0.5) * cell;
+                    double py = origin_y + (l * (FONT_HEIGHT + SIGN_LINE_GAP) + row + 0.5) * cell;
+                    if (legend_turn_zone(px, py)) continue;
+                    formation.x[formation.count] = px;
+                    formation.y[formation.count] = py;
+                    formation.lift[formation.count] = lift_the_colon && *c == ':' ? 1.0 : 0.0;
+                    formation.shift_y[formation.count] = 0;
+                    formation.glyph[formation.count] = letter - 1;
+                    formation.across[formation.count] = (indent + column + x + 0.5) / columns;
+                    formation.count++;
+                }
+            }
+            column += FONT_ADVANCE;
+        }
+    }
+    formation.writing = formation.count > 0;
+}
+
+/* Lays the text out and returns how many targets it made, zero if it will not
+ * fit or the text has nothing to draw. */
+static int formation_layout(const char *text) {
+    double pad = config.bird_size * 2.0;
+    double left = screen.legend_width > 0 ? screen.legend_width + config.speed + pad : pad;
+    double top = pad, right = screen.width - pad, bottom = screen.height - pad;
+    int columns = font_text_width(text);
+
+    formation_clear();
+    formation.sign = 0;
+    if (columns <= 0 || right - left < columns || bottom - top < FONT_HEIGHT) return 0;
+
+    /* One cell is as large as both dimensions allow, so the text fills the space
+     * it has without being stretched out of shape. */
+    double cell = (right - left) / columns;
+    double by_height = (bottom - top) / FONT_HEIGHT;
+    if (by_height < cell) cell = by_height;
+
+    formation_place(&text, 1, left, top, right, bottom, cell, 0);
+    return formation.count;
+}
+
+static int formation_target_of(int index, double *x, double *y) {
+    if (!formation.writing || formation.count == 0) return 0;
+    if (!formation.sign) {
+        *x = formation.x[index % formation.count];
+        *y = formation.y[index % formation.count];
+        return 1;
+    }
+    /* A sign picks its writers, and they hover: a few pixels of loop of their own
+     * round the place, and the colon's birds lift with the breath. */
+    int target = index >= 0 && index < MAX_BIRDS ? formation.slot[index] : -1;
+    if (target < 0) return 0;
+    *x = formation.x[target] + formation.hover_x[index];
+    *y = formation.y[target] + formation.hover_y[index] + formation.shift_y[target];
+    return 1;
+}
+
+/* A bird of a sign that has been scattered is no writer until it has come back:
+ * it flocks, and flees what scattered it, and then it goes home. */
+static int formation_target_for(const bird_t *bird, int index, double *x, double *y) {
+    if (bird->scattered > 0) return 0;
+    return formation_target_of(index, x, y);
+}
+
+/*
+ * The flock as a sign.
+ *
+ * The intro is three seconds of letters. A sign is the same idea held for as
+ * long as it takes to read: --say writes what it is given, --clock the time, and
+ * in both the flock stays at it, lets go now and then for a murmuration, and
+ * writes it again.
+ *
+ * What three seconds can do without and a minute cannot is stand still. A bird
+ * that lands and stops is dead on the screen after the first few seconds, so a
+ * bird of a sign hovers: it flies a small loop of its own about its place, with
+ * its own phase and pace, and the strokes shimmer and stay sharp. Not every bird
+ * writes. Round robin over eight hundred birds would put a dozen on every cell
+ * of a short word and leave nobody to fly; a sign gives a lit cell a few birds,
+ * and the rest keep flocking round it, kept out of the box the text is in.
+ */
+typedef enum { SIGN_NONE, SIGN_SAY, SIGN_CLOCK, SIGN_PICTURE } sign_kind_t;
+typedef enum { SIGN_FITS, SIGN_NO_ROOM, SIGN_TOO_FEW_BIRDS } sign_failure_t;
+
+static const char *say_text;           /* --say, as it was typed. */
+static char sign_words[SIGN_TEXT_MAX]; /* And as the font can draw it. */
+static int clock_mode;
+static const char *clock_start; /* --clock-at: a time to start from. */
+static int clock_seconds;       /* --seconds: HH:MM:SS. */
+static int sign_font_rows;      /* --font-size: a letter's height in rows, 0 if not given. */
+static int screensaver_mode;
+
+/* Half of the free width, centred, which is sky on either side for the flock,
+ * and not quite half of the height on a roomy screen, 160 by 45 cells and up; half
+ * and half on a small one, 96 by 26 and under, where the band the rest of the flock
+ * is kept out of is as wide in pixels as anywhere and the letters need what room
+ * there is. A roomy screen used to give the sign two thirds of its width and three
+ * fifths of its height: the letters were as large as they could be, and the rest
+ * of the flock had a corridor round them, which with the river of
+ * sign_orbit_vector is a belt the shape of the box. At half by not quite half the
+ * river has the room to be an ellipse round the text, and the text is still the
+ * largest thing on the screen. A small screen gave it half and half before the
+ * river too: measured on 800 birds saying HELLO WORLD at 96 by 26 cells and 25
+ * frames a second, against two thirds and three fifths, the sky outside the band
+ * went from 7% of the screen to 42%, the free birds within a bird of the sign or
+ * an edge from 23% to 6%, and the share of the sky with a bird in it from 1% to
+ * 26%. Less than half there is a smaller sign the hawks cross more often: with the
+ * river at two fifths, one hawk hunting round HELLO WORLD kept a tenth of its
+ * writers scattered, against a twentieth at half. */
+static const double SIGN_WIDTH_SHARE = 0.5, SIGN_WIDTH_SHARE_SMALL = 0.5;
+static const double SIGN_HEIGHT_SHARE = 0.45, SIGN_HEIGHT_SHARE_SMALL = 0.5;
+/* What a long text may take when those shares would make its letters smaller than
+ * SIGN_SMALLEST_CELL: two thirds of the width and three fifths of the height,
+ * which is what a roomy screen gave every sign before the river. At 80 by 24 with
+ * three lines that is what keeps a cell at eight pixels. */
+static const double SIGN_WIDTH_MOST = 2.0 / 3.0, SIGN_HEIGHT_MOST = 0.6;
+/* How many rows of the terminal a letter of a sign is tall: --font-size, or by
+ * default a seventh of the window's rows, from four to ten either way, and never
+ * more than the shares above leave room for. Tried from three rows to sixteen
+ * at 80 by 24, 120 by 34, 160 by 45 and 200 by 50 cells, with 10:09, 10:09:36 and
+ * HELLO WORLD, the free flock wheeling round. At three the cells are seven pixels
+ * and the text is lost in the river; past ten the birds, which are as large as
+ * the cells, are as large as the birds of a flock with nothing to write, and the
+ * river round the text is two heavy bands above and below it. Between them the
+ * best was four rows at 80 by 24, five at 120 by 34, five or six at 160 by 45 and
+ * six to eight at 200 by 50: a seventh of the rows. The shares alone, which made
+ * a short text as large as half the screen allowed, gave eleven rows at 200 by 50,
+ * which was the heavy one. */
+enum { SIGN_FONT_ROWS_MIN = 4, SIGN_FONT_ROWS_MAX = 10, SIGN_FONT_SHARE_OF_ROWS = 7 };
+/* The largest a cell grows, in bird sizes: past two and a half the cells of a
+ * short word are further apart than a bird is wide, and the letters fall apart
+ * into dots. */
+static const double SIGN_LARGEST_CELL = 2.5;
+/* At most this share of the flock writes, whatever the text, so that there is
+ * always a flock for it to be a sign in front of; and at most this many to a lit
+ * cell, because past four a cell is a smudge. A small screen lets more of the
+ * flock write, which is the other way round from what it sounds: the sky there
+ * is small, and every bird that is not writing is one more in it. With half the
+ * flock writing, a text of three lines was one bird to a cell and dim, and the
+ * free birds were a cloud round it; at seven tenths it is two to a cell, the
+ * letters are strokes, and there are fewer birds in the sky. HELLO WORLD is three
+ * to a cell at either. */
+static const double SIGN_WRITER_SHARE = 0.6, SIGN_WRITER_SHARE_SMALL = 0.7;
+enum { SIGN_PER_CELL_MAX = 4, PICTURE_KEPT_MAX = 1024 };
+/* A screen is small by its shorter side, in pixels: at or under SMALL_SIDE, which
+ * is the 96 by 26 of a recording, it is as small as it gets, and at or over
+ * ROOMY_SIDE, which is 160 by 45, it is as roomy as it needs to be, and between
+ * the two the shares above go from one end to the other in a straight line. */
+static const double SIGN_SMALL_SIDE = 416, SIGN_ROOMY_SIDE = 720;
+/* A sign does not give up size for sky below this cell, or what the roomy shares
+ * give it if that is less: at 64 by 18 with a long text the letters are already
+ * nine pixels, and at seven they stopped being letters. */
+static const double SIGN_SMALLEST_CELL = 8;
+/* The loop is a seventh of a bird across, and never more than a fifth of the
+ * distance between two cells, or the strokes blur into each other; a pixel and a
+ * half at least, or there is nothing to see, and six at most. */
+static const double SIGN_HOVER_SIZE = 0.14, SIGN_HOVER_CELL = 0.22;
+static const double SIGN_HOVER_MIN = 1.5, SIGN_HOVER_MAX = 6.0;
+/* The rest of the flock is turned away from the text about as firmly as from
+ * the pointer, from three birds off at the least. */
+static const double SIGN_KEEP_OUT_WEIGHT = 5.0;
+static const double SIGN_KEEP_OUT_BAND = 3.0;
+static const double SIGN_KEEP_OUT_STEPS = 4.0;
+/* The band is never wider than this share of the screen's shorter side. At the
+ * pace of a 25 frame recording four steps of flight are 150 pixels whatever the
+ * screen, which on 96 by 26 cells is all the sky there is: a fifth of the shorter
+ * side is 83. Measured at 25 frames, 800 birds, the free birds inside the text
+ * were 0.1%, as against none, and at 60 frames the band is four steps and
+ * under a fifth, as it was. On 200 by 50 cells it is as it was at either. */
+static const double SIGN_KEEP_OUT_MOST = 0.2;
+/* The river round a sign (see sign_orbit_vector). Its ellipse goes through the
+ * corners of the box grown by half the band, and keeps a bird and a half from the
+ * edges of the screen. The pull along it weighs what a full turn of alignment
+ * does, a little less than the flock's own; the pull back to it is as strong, felt
+ * from a quarter of the ellipse off it and in full three tenths further. Tried at
+ * 96 by 26 and 160 by 45 cells with HELLO WORLD and 10:09, looking at the frames
+ * and at a second of them laid on one another: along at 0.5 the river was there
+ * and still crossed itself, at 1.3 it was a belt that never changed, and from 0.7
+ * to 1 it is a river with arms that wheel round the text, every bird of it the
+ * colour of its heading, so the sky round the text turns like a wheel. */
+static const double SIGN_ORBIT_ALONG = 1.0, SIGN_ORBIT_BACK = 1.0;
+static const double SIGN_ORBIT_FREE = 0.25, SIGN_ORBIT_SOFT = 0.3;
+static const double SIGN_ORBIT_GROW = 1.41421356237, SIGN_ORBIT_BAND = 0.5;
+static const double SIGN_ORBIT_MARGIN = 1.5;
+/* The room kept clear past the panel's own edge, when there is one: a frame of
+ * flight at the shipped pace, which with the pad is more than a frame of flight at
+ * any pace short of the top two or three notches, and so a letter does not land in
+ * the panel's turn zone. At three frames, which is what the top notch asks, the
+ * room under the panel on an eighty column terminal was a hand's breadth. */
+static const double SIGN_PANEL_GAP = DEFAULT_SPEED;
+/* A clock lets go as a whole for this long, once an hour: long enough to be a
+ * murmuration, which is the show. The rest of the hour it only ever lets go of the
+ * letters that change, and the time can be read at any moment. It used to let go
+ * of every letter at each minute, and was unreadable for four seconds in sixty. */
+static const double SIGN_CLOCK_FLIGHT = 3.0;
+/* The colon rises by this many cells at the top of its breath. */
+static const double SIGN_BREATH_LIFT = 0.5;
+/* A pointer that has moved this lately is moving. A bird whose place it
+ * reaches is scattered for this long after the last time it did, and a little
+ * longer, bird by bird, so that they do not all come home as one. */
+static const double POINTER_MOVING_SECONDS = 0.6;
+static const double SCATTER_SECONDS = 1.2;
+static const double SCATTER_STAGGER = 1.0;
+/* A hawk scatters the places it passes within this share of the way to where the
+ * flock starts to flee it, for a shorter time than the pointer does. A hawk hunts
+ * the free birds, and those are all round a sign, so it is over the sign a good
+ * part of the time and not only when it dives. It scattered at 0.35 of the reach
+ * for 0.4 to 1.0 seconds, and on 800 birds at 96 by 26 cells 43% of the writers
+ * were scattered on average with one hawk up (a clock: 40%) and 67% with two: a
+ * sign was in pieces all the time. At 0.08, which is eleven pixels there, about
+ * the hawk's own half width, and 0.2 to 0.4 seconds, the share is 5 to 7% with
+ * one hawk and 9 to 12% with two, at 25 frames a second and at 60, at 96 by 26 and
+ * at 80 by 24, over twelve seeds. A hawk flown straight through the middle of a
+ * line of letters still scatters 26% of HELLO and 16% of 10:09, every bird of them
+ * three letter cells from home, at either rate. */
+static const double HAWK_SCATTER = 0.08;
+static const double HAWK_SCATTER_SECONDS = 0.2, HAWK_SCATTER_STAGGER = 0.2;
+/* A lock command is started by the key that is about to be pressed: input in the
+ * first half second is whatever started it. That is the first half second of the
+ * program and not of its first frame: a Kitty terminal is sent its sprites before
+ * there is a first frame, and a key typed in all that time is somebody waking the
+ * screen, long after what started it, and would be thrown away. So the grace is
+ * over when the start took longer than it. */
+static const double SCREENSAVER_GRACE = 0.5;
+static double launch_lag; /* Seconds from the program's first line to its first frame. */
+/* A lone escape is the Escape key, or the first byte of something that is still on
+ * its way: a terminal's late reply to a colour question begins with one. A lock
+ * screen waits this long for the rest before it takes it for somebody waking it.
+ * A reply written in one piece is read in one piece, so this is only for a reply
+ * that the network or a multiplexer cut in two, and a tenth of a second is slower
+ * than the cut and quicker than a hand. */
+static const double SCREENSAVER_ESCAPE_WAIT = 0.1;
+
+/* What a picture brings: the share of it that is ink, which says how far apart
+ * the birds that draw it are, the light and the dark of its colours, which say
+ * where on a ramp of somebody else's choosing each of them goes, and the shade
+ * every bird wears from the moment the picture is laid out. */
+static double picture_ink, picture_dark, picture_light;
+static int picture_shade[MAX_BIRDS];
+
+static struct {
+    sign_kind_t kind;
+    int up;         /* Being held, as far as the flock is concerned. */
+    unsigned cycle; /* Times held and let go, which varies the rhythm. */
+    double until;   /* On the run's clock: when the hold or the flight is over. */
+    double last_tick;
+    char written[SIGN_TEXT_MAX]; /* What is up now. */
+    int per_cell;                /* Birds to a lit cell, the same for every cell of it. */
+    /* Why the last layout failed, if one did, and what has come of it: said once at
+     * the end of the run, when the terminal is back, because inside it nobody
+     * could read it. */
+    sign_failure_t why;
+    int needs, has; /* Birds a text takes and the flock has, when that is what failed. */
+    int failures, was_up;
+    int failed_columns, failed_rows;
+    /* What the last failure was, kept apart from the layouts that came after it,
+     * which say why they fitted and not why that one did not. */
+    sign_failure_t failed_why;
+    int failed_needs, failed_has;
+    /* The most cells any text of this sign lights, and the birds the last picture
+     * was drawn with: what a window in a shared sky keeps for it. */
+    int budget, drawn_with;
+    int twelve_hours;
+    int seconds;       /* The clock shows them. */
+    unsigned seed;     /* --seed, for what a picture picks without the flock's numbers. */
+    int virtual_clock; /* The time is the start time and the run's clock, not the wall's. */
+    time_t origin;
+    /* The screen it was laid out for: a sign that outlives a window resize or the
+     * panel being opened is laid out again, and its birds fly to the new places. */
+    int key_width, key_height, key_legend_width, key_legend_height, key_birds, key_size;
+} the_sign;
+
+static int a_sign_is_asked_for(void) {
+    return the_sign.kind != SIGN_NONE;
+}
+
+/* The clock's second, to the nanosecond when it is the wall's, so the colon
+ * breathes on the tick; and a recording's own, from where it was told to start. */
+static time_t sign_wall_time(double *into_the_second) {
+    if (the_sign.virtual_clock) {
+        double whole = floor(clock_state.seconds);
+        *into_the_second = clock_state.seconds - whole;
+        return the_sign.origin + (time_t)whole;
+    }
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    *into_the_second = (double)now.tv_nsec / 1e9;
+    return now.tv_sec;
+}
+
+static void sign_local_now(struct tm *local) {
+    double unused;
+    time_t now = sign_wall_time(&unused);
+    if (localtime_r(&now, local) == NULL) memset(local, 0, sizeof(*local));
+}
+
+static void sign_text_now(char *out, size_t size) {
+    if (the_sign.kind == SIGN_CLOCK) {
+        struct tm local;
+        sign_local_now(&local);
+        sign_clock_text(&local, the_sign.twelve_hours, the_sign.seconds, out, size);
+    } else {
+        snprintf(out, size, "%s", sign_words);
+    }
+}
+
+static int sign_layout_is_current(void) {
+    return the_sign.key_width == screen.width && the_sign.key_height == screen.height &&
+           the_sign.key_legend_width == screen.legend_width &&
+           the_sign.key_legend_height == screen.legend_height &&
+           the_sign.key_birds == config.birds && the_sign.key_size == config.bird_size;
+}
+
+/* A layout starts from nothing, and remembers the screen it is for. */
+static void sign_begin_layout(void) {
+    formation_clear();
+    formation.sign = 1;
+    the_sign.key_width = screen.width;
+    the_sign.key_height = screen.height;
+    the_sign.key_legend_width = screen.legend_width;
+    the_sign.key_legend_height = screen.legend_height;
+    the_sign.key_birds = config.birds;
+    the_sign.key_size = config.bird_size;
+}
+
+/* 1 on a small screen and 0 on a roomy one, and between them in a straight line. */
+static double sign_smallness(void) {
+    double shorter = screen.width < screen.height ? screen.width : screen.height;
+    double small = (SIGN_ROOMY_SIDE - shorter) / (SIGN_ROOMY_SIDE - SIGN_SMALL_SIDE);
+    return small < 0 ? 0 : (small > 1 ? 1 : small);
+}
+
+static double sign_share(double roomy, double small) {
+    return roomy + sign_smallness() * (small - roomy);
+}
+
+/* How far from the text the rest of the flock is turned away: felt some steps of
+ * flight before the box and not at a fixed distance, but never more than a share
+ * of the screen, and never less than three birds. */
+static double sign_band(void) {
+    double shorter = screen.width < screen.height ? screen.width : screen.height;
+    double band = SIGN_KEEP_OUT_STEPS * config.speed;
+    if (band > SIGN_KEEP_OUT_MOST * shorter) band = SIGN_KEEP_OUT_MOST * shorter;
+    return band < formation.band ? formation.band : band;
+}
+
+/* How many rows tall the letters are to be. */
+static int sign_font_rows_now(void) {
+    if (sign_font_rows > 0) return sign_font_rows;
+    int rows = (int)((double)screen.rows / SIGN_FONT_SHARE_OF_ROWS + 0.5);
+    return rows < SIGN_FONT_ROWS_MIN ? SIGN_FONT_ROWS_MIN
+                                     : (rows > SIGN_FONT_ROWS_MAX ? SIGN_FONT_ROWS_MAX : rows);
+}
+
+/* The side of a lit cell for that, in pixels: a letter is FONT_HEIGHT cells tall. */
+static double sign_font_cell(void) {
+    if (screen.rows <= 0 || screen.height <= 0) return 0;
+    return sign_font_rows_now() * ((double)screen.height / screen.rows) / FONT_HEIGHT;
+}
+
+/* The sign that fits in a room: the cleaned text wrapped onto the lines that make
+ * its cell largest, in the share of the room the size of the screen gives it. The
+ * cell is not taken below SMALLEST_CELL, or below what the most a sign may take
+ * gives if that is less, so that a long text on a small screen is as large as it
+ * was and not smaller still. Returns the lines (0 if it does not fit), and the
+ * width and height of the share that was used. */
+static int sign_fit_in(const char *clean, int reference_columns, double room_width,
+                       double room_height, double largest, sign_lines_t *lines, double *cell,
+                       double *width, double *height) {
+    double most_width = room_width * SIGN_WIDTH_MOST, most_height = room_height * SIGN_HEIGHT_MOST;
+    /* The font's size, on as few lines as it fits on, or as large as fits. */
+    double font = sign_font_cell();
+    if (font > 0 && font < largest) largest = font;
+    *width = room_width * sign_share(SIGN_WIDTH_SHARE, SIGN_WIDTH_SHARE_SMALL);
+    *height = room_height * sign_share(SIGN_HEIGHT_SHARE, SIGN_HEIGHT_SHARE_SMALL);
+    int count = sign_fit(clean, reference_columns, *width, *height, largest, lines, cell);
+    if (count > 0 && *cell >= SIGN_SMALLEST_CELL) return count;
+    sign_lines_t most;
+    double most_cell;
+    int most_count =
+        sign_fit(clean, reference_columns, most_width, most_height, largest, &most, &most_cell);
+    if (most_count == 0) return count;
+    double wanted = most_cell < SIGN_SMALLEST_CELL ? most_cell : SIGN_SMALLEST_CELL;
+    if (count > 0 && *cell >= wanted) return count;
+    *lines = most;
+    *cell = wanted;
+    *width = most_width;
+    *height = most_height;
+    return most_count;
+}
+
+/* The widest a clock gets, which sizes its cells: so that it does not change size
+ * between 1:09 and 10:09. */
+static int sign_clock_columns(void) {
+    return sign_columns(the_sign.seconds ? "00:00:00" : "00:00");
+}
+
+/* How far a bird loops, for targets this far apart. */
+static double sign_hover_for(double cell) {
+    double hover = SIGN_HOVER_SIZE * config.bird_size;
+    if (SIGN_HOVER_CELL * cell < hover) hover = SIGN_HOVER_CELL * cell;
+    if (hover < SIGN_HOVER_MIN) hover = SIGN_HOVER_MIN;
+    if (hover > SIGN_HOVER_MAX) hover = SIGN_HOVER_MAX;
+    return hover;
+}
+
+/* The room a sign may have: the screen less a pad all round, as the intro has it.
+ * With the panel up there are two, the panel's corner being left out of either: the
+ * one beside it, which is what the intro takes, and the one under it, which on an
+ * eighty column terminal is the wider by far. The sign takes whichever makes its
+ * letters larger. */
+typedef struct {
+    double left, top, right, bottom;
+} sign_room_t;
+
+static int sign_rooms(sign_room_t rooms[2]) {
+    double pad = config.bird_size * 2.0;
+    rooms[0] = (sign_room_t){pad, pad, screen.width - pad, screen.height - pad};
+    if (screen.legend_width <= 0) return 1;
+    rooms[1] = rooms[0];
+    rooms[0].left = screen.legend_width + SIGN_PANEL_GAP + pad;
+    rooms[1].top = screen.legend_height + SIGN_PANEL_GAP + pad;
+    return 2;
+}
+
+/* Lays the cleaned text out as a sign and picks its writers from the birds.
+ * Returns whether it fits: the screen may be too small, or the flock too small
+ * for the text, and then the flock simply flocks. */
+static int sign_place(const char *clean, int reference_columns, int lift_the_colon,
+                      const bird_t *birds) {
+    sign_room_t rooms[2];
+    int room_count = sign_rooms(rooms);
+    sign_lines_t lines;
+    double cell = 0;
+    int line_count = 0;
+    double left = 0, top = 0, free_width = 0, free_height = 0, width = 0, height = 0;
+    for (int r = 0; r < room_count; r++) {
+        sign_lines_t tried;
+        double tried_cell, tried_width, tried_height;
+        double room_width = rooms[r].right - rooms[r].left;
+        double room_height = rooms[r].bottom - rooms[r].top;
+        int tried_count = sign_fit_in(clean, reference_columns, room_width, room_height,
+                                      SIGN_LARGEST_CELL * config.bird_size, &tried, &tried_cell,
+                                      &tried_width, &tried_height);
+        if (tried_count == 0 || tried_cell <= cell) continue;
+        lines = tried;
+        cell = tried_cell;
+        line_count = tried_count;
+        left = rooms[r].left;
+        top = rooms[r].top;
+        free_width = room_width;
+        free_height = room_height;
+        width = tried_width;
+        height = tried_height;
+    }
+    sign_begin_layout();
+    the_sign.why = SIGN_NO_ROOM;
+    if (line_count == 0) return 0;
+
+    int lit = 0;
+    const char *text[SIGN_MAX_LINES];
+    for (int l = 0; l < line_count; l++) {
+        text[l] = lines.line[l];
+        lit += font_text_cells(lines.line[l]);
+    }
+    int near_birds = 0;
+    for (int i = 0; i < config.birds; i++) near_birds += birds[i].layer == 0;
+    if (lit > FORMATION_MAX_TARGETS || lit > near_birds) {
+        the_sign.why = SIGN_TOO_FEW_BIRDS;
+        the_sign.needs = lit;
+        the_sign.has = near_birds < FORMATION_MAX_TARGETS ? near_birds : FORMATION_MAX_TARGETS;
+        return 0;
+    }
+
+    /* The text is centred by where its birds are drawn, which is a bird's top left
+     * corner: half a bird off to the right and down of the place it is flown to. */
+    double shift = config.bird_size / 2.0;
+    left += (free_width - width) / 2 - shift;
+    top += (free_height - height) / 2 - shift;
+    formation_place(text, line_count, left, top, left + width, top + height, cell, lift_the_colon);
+    if (formation.count == 0) return 0; /* All of it in the panel's corner. */
+
+    formation.cell = cell;
+    formation.hover = sign_hover_for(cell);
+
+    /* A few birds to a lit cell, as many as the flock can spare, and the same
+     * number to every cell for as long as the text is up. A clock is budgeted for
+     * the busiest minute of its hour and not for the minute it is writing: it
+     * changes a letter at a time, and a cell that had four birds at ten past ten
+     * and three at ten to eleven would be a stroke that thickens and thins. With
+     * the seconds it is the busiest second of the hour. */
+    int budget = formation.count;
+    if (the_sign.kind == SIGN_CLOCK) {
+        struct tm when;
+        sign_local_now(&when);
+        for (int minute = 0; minute < 60; minute++)
+            for (int second = 0; second < (the_sign.seconds ? 60 : 1); second++) {
+                char time_text[SIGN_TEXT_MAX];
+                when.tm_min = minute;
+                if (the_sign.seconds) when.tm_sec = second;
+                sign_clock_text(&when, the_sign.twelve_hours, the_sign.seconds, time_text,
+                                sizeof(time_text));
+                if (font_text_cells(time_text) > budget) budget = font_text_cells(time_text);
+            }
+    }
+    the_sign.budget = budget;
+    int per_cell =
+        (int)(near_birds * sign_share(SIGN_WRITER_SHARE, SIGN_WRITER_SHARE_SMALL)) / budget;
+    if (per_cell > SIGN_PER_CELL_MAX) per_cell = SIGN_PER_CELL_MAX;
+    if (per_cell < 1) per_cell = 1;
+    the_sign.per_cell = per_cell;
+
+    /* The box the rest of the flock is turned away from: the text, and a bird's
+     * width round it. */
+    double x_min = left + width, x_max = left, y_min = top + height, y_max = top;
+    for (int t = 0; t < formation.count; t++) {
+        if (formation.x[t] < x_min) x_min = formation.x[t];
+        if (formation.x[t] > x_max) x_max = formation.x[t];
+        if (formation.y[t] < y_min) y_min = formation.y[t];
+        if (formation.y[t] > y_max) y_max = formation.y[t];
+    }
+    formation.box = (sign_box_t){x_min - config.bird_size, y_min - config.bird_size,
+                                 x_max + config.bird_size, y_max + config.bird_size};
+    formation.band = SIGN_KEEP_OUT_BAND * config.bird_size;
+    formation.keep_out = 1;
+    the_sign.why = SIGN_FITS;
+    return 1;
+}
+
+/* Every lit cell gets its birds, the first of the near flock in order, so a cell
+ * is told only by its number. */
+static void sign_send_the_writers(const bird_t *birds) {
+    int near_birds = 0;
+    for (int i = 0; i < config.birds; i++) near_birds += birds[i].layer == 0;
+    int writers = the_sign.per_cell * formation.count;
+    if (writers > near_birds) writers = near_birds;
+    for (int i = 0; i < MAX_BIRDS; i++) formation.slot[i] = -1;
+    int next = 0;
+    for (int i = 0; i < config.birds && next < writers; i++) {
+        if (birds[i].layer > 0) continue; /* The far sky is another sky. */
+        formation.slot[i] = next++ % formation.count;
+    }
+}
+
+/* Which shade of the run's ramp a colour of the picture is: the nearest of the
+ * picture's own colours when they are the ramp, and otherwise its light and dark
+ * stretched along the ramp somebody chose, light at the light end of it. */
+static int picture_shade_of(const uint8_t rgb[3]) {
+    int shades = palette_shades();
+    if (shades <= 1) return 0;
+    if (picture_colours_in_use) {
+        int nearest =
+            picture_nearest((const uint8_t(*)[3])picture_tints, picture_palette.shades, rgb);
+        return nearest < shades ? nearest : shades - 1;
+    }
+    double span = picture_light - picture_dark;
+    double lightness = span > 1e-6 ? (picture_luminance(rgb) - picture_dark) / span : 0.5;
+    if (lightness < 0) lightness = 0;
+    if (lightness > 1) lightness = 1;
+    int shade = (int)((1.0 - lightness) * shades);
+    return shade >= shades ? shades - 1 : shade;
+}
+
+/* The picture, fitted into the free rectangle as the intro's letters are, and a
+ * place in it for every bird there is: they are spread evenly over the ink, and
+ * each of them wears the colour of the picture where it goes. */
+static int sign_place_picture(void) {
+    static picture_point_t points[MAX_BIRDS];
+    sign_room_t rooms[2];
+    int room_count = sign_rooms(rooms);
+
+    sign_begin_layout();
+    the_sign.why = SIGN_NO_ROOM;
+    /* Centred by where a bird is drawn, as a sign is: from its top left corner. */
+    double shift = config.bird_size / 2.0;
+    picture_fit_t fit = {0, 0, 0, 0, 0};
+    for (int r = 0; r < room_count; r++) {
+        picture_fit_t tried =
+            picture_fit(&picture_image, rooms[r].left - shift, rooms[r].top - shift,
+                        rooms[r].right - rooms[r].left, rooms[r].bottom - rooms[r].top);
+        if (tried.scale > fit.scale) fit = tried;
+    }
+    if (fit.scale <= 0) return 0;
+    int made = picture_sample(&picture_image, &fit, config.birds, the_sign.seed, points);
+    if (made == 0) return 0;
+    for (int i = 0; i < made; i++) {
+        formation.x[i] = points[i].x;
+        formation.y[i] = points[i].y;
+        formation.lift[i] = 0;
+        formation.shift_y[i] = 0;
+        formation.slot[i] = i;
+        picture_shade[i] = picture_shade_of(points[i].rgb);
+    }
+    for (int i = made; i < MAX_BIRDS; i++) formation.slot[i] = -1;
+    formation.count = made;
+    formation.writing = 1;
+    /* The distance between two birds that are neighbours in the picture. */
+    formation.cell = sqrt(fit.width * fit.height * picture_ink / made);
+    formation.hover = sign_hover_for(formation.cell);
+    the_sign.why = SIGN_FITS;
+    return 1;
+}
+
+/* Where every writer is in its loop, and how far the colon has risen, this frame. */
+static void sign_move_the_letters(void) {
+    for (int i = 0; i < config.birds; i++)
+        if (formation.slot[i] >= 0)
+            sign_hover((unsigned)i, clock_state.seconds, formation.hover, &formation.hover_x[i],
+                       &formation.hover_y[i]);
+    double fraction = 0;
+    if (the_sign.kind == SIGN_CLOCK) (void)sign_wall_time(&fraction);
+    double breath = sign_breath(fraction);
+    for (int t = 0; t < formation.count; t++)
+        formation.shift_y[t] = -formation.lift[t] * SIGN_BREATH_LIFT * formation.cell * breath;
+}
+
+/* The targets of a letter are a run of them, and the first and how many of the
+ * run are all there is to know of where a letter is. */
+static int sign_find_the_letters(int first[], int cells[], int most) {
+    int letters = 0;
+    for (int t = 0; t < formation.count; t++) {
+        int letter = formation.glyph[t];
+        if (letter >= most) break;
+        while (letters <= letter) {
+            first[letters] = t;
+            cells[letters] = 0;
+            letters++;
+        }
+        cells[letter]++;
+    }
+    return letters;
+}
+
+typedef struct {
+    double distance;
+    int bird;
+} sign_candidate_t;
+
+static int sign_nearer(const void *a, const void *b) {
+    double d = ((const sign_candidate_t *)a)->distance - ((const sign_candidate_t *)b)->distance;
+    return (d > 0) - (d < 0);
+}
+
+/* The birds that write a letter that was not there: the ones nearest to it that
+ * are flocking. Those that wrote what it replaces have only now been let go, and
+ * are used only if there is nobody else, so that a letter is a letter made of new
+ * birds and not the same ones turning into another. A digit of the seconds is the
+ * other way round (`own` is its number, and -1 for any other letter): its birds
+ * move over to the next digit, which is a hop of a few pixels where the flock is a
+ * flight from round the sign, so the seconds can be read while they tick. They are
+ * matched to the letter's cells nearest first, each cell taking as many as every
+ * other, so that the letter is as thick as the ones that held. */
+static void sign_send_the_birds_to_a_letter(const bird_t *birds, const char *let_go,
+                                            const int *was_glyph, int own, int first, int cells) {
+    static sign_candidate_t candidates[MAX_BIRDS];
+    double centre_x = 0, centre_y = 0;
+    for (int t = first; t < first + cells; t++) {
+        centre_x += formation.x[t] / cells;
+        centre_y += formation.y[t] / cells;
+    }
+    int count = 0;
+    for (int i = 0; i < config.birds; i++) {
+        if (formation.slot[i] >= 0 || birds[i].layer > 0 || birds[i].scattered > 0) continue;
+        double dx = birds[i].x - centre_x, dy = birds[i].y - centre_y;
+        /* Behind everybody who was already flying free, however far they are; or,
+         * for a digit of the seconds, its own birds ahead of everybody. */
+        double order = own < 0 ? (let_go[i] ? 1 : 0) : was_glyph[i] == own ? 0 : let_go[i] ? 2 : 1;
+        candidates[count].distance = dx * dx + dy * dy + order * 1e12;
+        candidates[count].bird = i;
+        count++;
+    }
+    qsort(candidates, (size_t)count, sizeof(*candidates), sign_nearer);
+
+    static int taken[FORMATION_MAX_TARGETS];
+    for (int t = first; t < first + cells; t++) taken[t] = 0;
+    int wanted = the_sign.per_cell * cells;
+    if (wanted > count) wanted = count;
+    for (int c = 0; c < wanted; c++) {
+        int bird = candidates[c].bird, best = -1;
+        double nearest = 0;
+        for (int t = first; t < first + cells; t++) {
+            if (taken[t] >= the_sign.per_cell) continue;
+            double dx = birds[bird].x - formation.x[t], dy = birds[bird].y - formation.y[t];
+            double d = dx * dx + dy * dy;
+            if (best < 0 || d < nearest) {
+                best = t;
+                nearest = d;
+            }
+        }
+        taken[best]++;
+        formation.slot[bird] = best;
+    }
+}
+
+/* A new minute on a clock that is not a new hour, or a new second on a clock that
+ * shows them: the letters that changed are let go of and written by other birds,
+ * or for the seconds moved over by their own, and the rest are not touched, so the
+ * time can be read throughout. Returns 0, with nothing done, when it is the whole sign
+ * that has to go: the hour, a text of another length or another hour, or a
+ * layout that is no longer for this screen. */
+static int sign_change_the_letters(const bird_t *birds, const char *shown) {
+    char was[SIGN_TEXT_MAX], now[SIGN_TEXT_MAX];
+    sign_clean(the_sign.written, was, sizeof(was));
+    int letters = sign_clean(shown, now, sizeof(now));
+    size_t length = strlen(now);
+    const char *colon = strchr(now, ':');
+    if (letters == 0 || strlen(was) != length || colon == NULL || length < 2) return 0;
+    if (strncmp(was, now, (size_t)(colon - now) + 1) != 0) return 0; /* The hour changed. */
+    if (strspn(colon, ":0") == strlen(colon)) return 0;              /* The hour is here. */
+    if (!sign_layout_is_current()) return 0;
+    /* The digits after the second colon are the seconds. */
+    const char *seconds_colon = strchr(colon + 1, ':');
+    int first_second = seconds_colon != NULL ? (int)(seconds_colon - now) + 1 : (int)length;
+
+    static int was_slot[MAX_BIRDS], was_glyph[MAX_BIRDS];
+    static char let_go[MAX_BIRDS];
+    int was_first[SIGN_TEXT_MAX], was_cells[SIGN_TEXT_MAX];
+    int now_first[SIGN_TEXT_MAX], now_cells[SIGN_TEXT_MAX];
+    int was_letters = sign_find_the_letters(was_first, was_cells, SIGN_TEXT_MAX);
+    memcpy(was_slot, formation.slot, sizeof(*was_slot) * (size_t)config.birds);
+    sign_box_t box = formation.box;
+    double band = formation.band;
+
+    /* Laid out again for the new text, which puts every letter that did not change
+     * exactly where it was: the same cell, the same size. Only the numbers of its
+     * targets move, with the letters before it. */
+    if (!sign_place(now, sign_clock_columns(), 1, birds)) return 0;
+    formation.box = box;
+    formation.band = band;
+    int now_letters = sign_find_the_letters(now_first, now_cells, SIGN_TEXT_MAX);
+    int changed[SIGN_TEXT_MAX];
+    for (int g = 0; g < now_letters; g++)
+        changed[g] = g >= was_letters || was[g] != now[g] || was_cells[g] != now_cells[g];
+
+    for (int i = 0; i < config.birds; i++) {
+        let_go[i] = 0;
+        was_glyph[i] = -1;
+        formation.slot[i] = -1;
+        int old = was_slot[i];
+        if (old < 0) continue;
+        for (int g = 0; g < was_letters; g++) {
+            if (old < was_first[g] || old >= was_first[g] + was_cells[g]) continue;
+            if (g < now_letters && !changed[g]) {
+                formation.slot[i] = now_first[g] + (old - was_first[g]);
+            } else {
+                let_go[i] = 1;
+                was_glyph[i] = g;
+            }
+        }
+    }
+    for (int g = 0; g < now_letters; g++)
+        if (changed[g])
+            sign_send_the_birds_to_a_letter(birds, let_go, was_glyph, g >= first_second ? g : -1,
+                                            now_first[g], now_cells[g]);
+
+    snprintf(the_sign.written, sizeof(the_sign.written), "%s", shown);
+    sign_move_the_letters();
+    return 1;
+}
+
+static int sign_write(const bird_t *birds) {
+    char text[SIGN_TEXT_MAX] = "";
+    char clean[SIGN_TEXT_MAX];
+    int fits;
+    if (the_sign.kind == SIGN_PICTURE) {
+        fits = sign_place_picture();
+    } else {
+        sign_text_now(text, sizeof(text));
+        sign_clean(text, clean, sizeof(clean));
+        fits = sign_place(clean, the_sign.kind == SIGN_CLOCK ? sign_clock_columns() : 0,
+                          the_sign.kind == SIGN_CLOCK, birds);
+        if (fits) sign_send_the_writers(birds);
+    }
+    if (!fits) {
+        formation_clear();
+        the_sign.up = 0;
+        the_sign.failures++;
+        the_sign.failed_columns = screen.cols;
+        the_sign.failed_rows = screen.rows;
+        the_sign.failed_why = the_sign.why;
+        the_sign.failed_needs = the_sign.needs;
+        the_sign.failed_has = the_sign.has;
+        return 0;
+    }
+    if (the_sign.kind == SIGN_PICTURE) the_sign.drawn_with = formation.count;
+    snprintf(the_sign.written, sizeof(the_sign.written), "%s", text);
+    formation.until = -1; /* A sign lets go when it is time, not when the intro is. */
+    the_sign.up = 1;
+    the_sign.was_up = 1;
+    sign_move_the_letters();
+    return 1;
+}
+
+static void sign_let_go(void) {
+    formation_clear();
+    the_sign.up = 0;
+    the_sign.until =
+        clock_state.seconds +
+        (the_sign.kind == SIGN_CLOCK ? SIGN_CLOCK_FLIGHT : sign_flight_seconds(the_sign.cycle));
+    the_sign.cycle++; /* One held and flown: the next is a little different. */
+}
+
+/* Said when the run is over and the terminal is back, and not before: a sign that
+ * cannot be laid out once the run has started, because the window is smaller than
+ * it was told of or the flock has shrunk, leaves the flock flying as usual, and
+ * inside the alternate screen nobody can read why. Once, for the last time it
+ * failed. */
+static void sign_report_failure(void) {
+    if (the_sign.failures == 0) return;
+    const char *option = the_sign.kind == SIGN_CLOCK     ? "--clock"
+                         : the_sign.kind == SIGN_PICTURE ? "--picture"
+                                                         : "--say";
+    const char *what = the_sign.kind == SIGN_CLOCK     ? "the time"
+                       : the_sign.kind == SIGN_PICTURE ? "the picture"
+                                                       : "the text";
+    char reason[160];
+    if (the_sign.failed_why == SIGN_TOO_FEW_BIRDS)
+        snprintf(reason, sizeof(reason),
+                 "it takes %d birds to write and the flock has %d to write with",
+                 the_sign.failed_needs, the_sign.failed_has);
+    else if (the_sign.kind == SIGN_PICTURE)
+        snprintf(reason, sizeof(reason), "there is no room for it");
+    else
+        snprintf(reason, sizeof(reason), "%s is too big for it", what);
+    fprintf(stderr, "%s: %s could not be laid out%s on a screen of %d by %d cells: %s%s\n",
+            program_name, option, the_sign.was_up ? " for a time" : "", the_sign.failed_columns,
+            the_sign.failed_rows, reason, the_sign.was_up ? "" : ", so the flock flew as usual");
+    the_sign.failures = 0; /* Said. */
+}
+
+static void begin_the_sign(void) {
+    the_sign.up = 0;
+    the_sign.cycle = 0;
+    the_sign.until = clock_state.seconds;
+    the_sign.last_tick = clock_state.seconds;
+    formation_clear();
+    formation.sign = 1;
+}
+
+/* Once a frame, before the flock flies: the sign is written, held, let go of
+ * and written again. A pause holds it too, so that a sign does not let go the
+ * moment a pause is over. */
+static void sign_advance(const bird_t *birds) {
+    if (the_sign.kind == SIGN_NONE) return;
+    double now = clock_state.seconds;
+    double waited = now - the_sign.last_tick;
+    the_sign.last_tick = now;
+    if (paused && !step_once) {
+        if (the_sign.until >= 0) the_sign.until += waited;
+        return;
+    }
+
+    if (!the_sign.up) {
+        if (now < the_sign.until) return;
+        if (sign_write(birds)) {
+            the_sign.until =
+                the_sign.kind == SIGN_CLOCK ? -1 : now + sign_hold_seconds(the_sign.cycle);
+        } else {
+            the_sign.until = now + 1; /* The screen may be bigger by then. */
+        }
+        return;
+    }
+    int new_minute = 0;
+    if (the_sign.kind == SIGN_CLOCK) {
+        char shown[SIGN_TEXT_MAX];
+        sign_text_now(shown, sizeof(shown));
+        new_minute = strcmp(shown, the_sign.written) != 0;
+        /* A minute lets go of the letters that changed and nothing else; the hour
+         * lets go of all of them, which is the show. */
+        if (new_minute && sign_change_the_letters(birds, shown)) return;
+    }
+    if (new_minute || (the_sign.until >= 0 && now >= the_sign.until)) {
+        sign_let_go();
+        return;
+    }
+    if (!sign_layout_is_current() && !sign_write(birds)) {
+        the_sign.until = now + 1;
+        return;
+    }
+    sign_move_the_letters();
+}
+
+/* The rest of the flock is turned away from the text while it is up. Zero for a
+ * bird of the far sky, and with no sign. */
+static vector_t sign_keep_out_vector(const bird_t *bird) {
+    vector_t push = {0, 0};
+    if (!formation.writing || !formation.keep_out || bird->layer > 0) return push;
+    /* Felt some steps of flight before the box, and not at a fixed distance: a
+     * band of three birds is crossed in a frame or two at the pace of a 25 frame
+     * recording. Measured on 800 birds saying HELLO WORLD for forty seconds, with
+     * the band alone, a hundredth of the free flock was inside the text at any
+     * moment at 25 frames a second on 96 by 26 cells, and a five hundredth at 60
+     * on 200 by 50; with the band at four steps of flight, none and a three
+     * thousandth. */
+    sign_box_push(&formation.box, sign_band(), bird->x, bird->y, &push.x, &push.y);
+    return push;
+}
+
+/* The rest of the flock flies round the sign, all of it the same way, on an
+ * ellipse through the corners of the text and its band, or as near to that as the
+ * screen has room for. Kept out of the box and nothing more, it came at the text
+ * from every side, split left and right at it, and met itself on the far side:
+ * streams that crossed, clumps against the edges, and birds over the letters. A
+ * pull along the ellipse makes one river of it, and a pull back to the ellipse
+ * keeps the river round the sign instead of in a corner; a bird a quarter of the
+ * way off it either side is left to the flock, so the river breathes, bunches and
+ * thins as a murmuration does. The way round turns with each hold. */
+static vector_t sign_orbit_vector(const bird_t *bird) {
+    vector_t flow = {0, 0};
+    if (!formation.writing || !formation.keep_out || bird->layer > 0) return flow;
+    /* A sky shared through a door is one the birds cross, and a river round the
+     * text kept them from the door: in a window of 120 by 40 cells, with letters a
+     * seventh of it tall, fewer than a hundred crossed it one way or the other in
+     * fourteen seconds, and more than a hundred cross each way without it. */
+    if (open_edges.left || open_edges.right) return flow;
+    const sign_box_t *box = &formation.box;
+    double band = sign_band() * SIGN_ORBIT_BAND;
+    double cx = (box->left + box->right) / 2, cy = (box->top + box->bottom) / 2;
+    double a = ((box->right - box->left) / 2 + band) * SIGN_ORBIT_GROW;
+    double b = ((box->bottom - box->top) / 2 + band) * SIGN_ORBIT_GROW;
+    double margin = SIGN_ORBIT_MARGIN * config.bird_size;
+    double room_x = (cx < screen.width - cx ? cx : screen.width - cx) - margin;
+    double room_y = (cy < screen.height - cy ? cy : screen.height - cy) - margin;
+    if (a > room_x) a = room_x;
+    if (b > room_y) b = room_y;
+    if (a < 1 || b < 1) return flow;
+    double u = (bird->x - cx) / a, v = (bird->y - cy) / b;
+    double r = sqrt(u * u + v * v);
+    if (r < 1e-9) return flow;
+    /* Along: the ellipse's own tangent where the bird is. Back: its normal. */
+    double along_x = -a * v, along_y = b * u;
+    double along = sqrt(along_x * along_x + along_y * along_y);
+    double out_x = u / a, out_y = v / b;
+    double out = sqrt(out_x * out_x + out_y * out_y);
+    double sense = the_sign.cycle % 2 ? -1.0 : 1.0;
+    flow.x = sense * SIGN_ORBIT_ALONG * along_x / along;
+    flow.y = sense * SIGN_ORBIT_ALONG * along_y / along;
+    double off = r - 1;
+    if (off > SIGN_ORBIT_FREE || off < -SIGN_ORBIT_FREE) {
+        double pull = (off > 0 ? off - SIGN_ORBIT_FREE : off + SIGN_ORBIT_FREE) / SIGN_ORBIT_SOFT;
+        if (pull > 1) pull = 1;
+        if (pull < -1) pull = -1;
+        flow.x -= SIGN_ORBIT_BACK * pull * out_x / out;
+        flow.y -= SIGN_ORBIT_BACK * pull * out_y / out;
+    }
+    return flow;
+}
+
+/* A writer is coloured by where its place is along the text, from one end of the
+ * ramp to the other, and a wrapped text runs the whole ramp on every line. Tried
+ * against a hash of the bird, which speckled every letter across the ramp, and
+ * against a colour a line (flat, and sloping down the lines): the gradient reads
+ * best, a word coming out as a few letters of one shade each. By line, the last
+ * line of ice or ember is the dark end of the ramp from end to end, and is the
+ * dimmest line of the sign; with the ramp on every line, every line is as easy to
+ * read as the first. The shade is the place's and not the bird's, so a letter that
+ * is written again by other birds is the colour it was. */
+static int sign_shade_for(int index) {
+    int shades = palette_shades();
+    int shade = (int)(formation.across[formation.slot[index]] * shades);
+    return shade >= shades ? shades - 1 : shade;
+}
+
+/* It opens by writing its name, in the middle, for a moment; then the flock
+ * takes over from wherever the letters left it, which is the nicest part to
+ * watch. A keypress ends it early, and a screen too small for the word simply
+ * starts flocking. */
+static void begin_the_intro(void) {
+    if (letters_mode) return; /* The text is the intro. */
+    if (sky_mode) return;     /* The letters are laid out on a screen, and this is a space. */
+    /* A sign is what the flock writes instead, if one was asked for. */
+    if (a_sign_is_asked_for()) {
+        begin_the_sign();
+        return;
+    }
+    if (formation_layout("BOIDS")) formation.until = INTRO_SECONDS;
+}
+
+static double normalized_angle(double y, double x) {
+    double angle = atan2(y, x);
+    return angle < 0 ? angle + 2 * M_PI : angle;
+}
+
+/*
+ * Wind.
+ *
+ * A slow wandering breeze, which is what keeps a flock off centre and stops a
+ * long run looking like it has settled. The direction takes a small random step
+ * each frame, so it drifts rather than jumping, and the strength is a notch like
+ * everything else.
+ */
+/* The rain falls, and nothing else has a wind. As a slider it did not do the one
+ * thing it was for — it was meant to keep a flock off centre, and at full strength
+ * the flock sat 34% off centre against 33% with no wind at all — while tripling
+ * the share of birds outside the frame. What is left of it is the downdraught
+ * that makes --matrix rain. */
+static int the_rain_is_falling;
+
+static vector_t wind_vector(void) {
+    vector_t force = {0, 0};
+    if (!the_rain_is_falling) return force;
+    force.y = 1; /* Straight down, and it stays there. */
+    return force;
+}
+
+/*
+ * Turning inertia.
+ *
+ * A bird that can turn any amount in one frame moves like a particle: the flock
+ * comes out as a blob that changes shape instantly. Cap the turn and it banks
+ * instead, which gives the flock curved fronts, a leading edge, and the look of
+ * something with mass. This is the single change that makes it read as birds
+ * rather than as points, which is why the default is eight of twelve rather than
+ * the twelve it used to effectively be.
+ *
+ * Writing is exempt. It already overrules the flocking rules, and a bird that
+ * cannot turn sharply cannot land on a letter: it would circle one instead, and
+ * the crispness of the letters is the whole point of them.
+ */
+static double turn_towards(double from, double to, double most) {
+    double delta = atan2(sin(to - from), cos(to - from));
+    if (delta > most) delta = most;
+    if (delta < -most) delta = -most;
+    double turned = from + delta;
+    if (turned < 0) turned += 2 * M_PI;
+    if (turned >= 2 * M_PI) turned -= 2 * M_PI;
+    return turned;
+}
+
+/* Twelve is instant, zero is as near a straight line as a bird gets — near, and
+ * not exactly, because a bird that cannot turn at all cannot be turned back by
+ * the edges either: at a true zero the whole flock flew out of the frame within a
+ * second and the screen stayed black until something else was pressed.
+ *
+ * Scaled by elapsed time, like the speed is, so that both are really per-second
+ * quantities and a bird's turning circle is the same number of pixels whatever
+ * rate the renderer achieves. Left per frame, an unlocked run would move and turn
+ * the flock faster simply because its loop ran more often. */
+/* What the notch itself means, before elapsed time has its say: this is what
+ * the panel shows, because the panel is about notches. */
+static double turning_notch_radians(void) {
+    if (config.turning_notch >= LEGEND_BAR_CELLS) return 2 * M_PI;
+    /* The whole bar is a setting somebody might want: from a sixth of a turn a
+     * frame, which is a long lazy bank that swings wide, up to a quarter.
+     * Measured from zero instead, the bottom third of the travel put between a
+     * tenth and all of the flock outside the screen — at the very bottom no bird
+     * could turn at all, so the edges could not turn them back either and the
+     * whole flock left inside a second — and the bar was half poison, with the
+     * README recommending a value from the poisoned half. */
+    return M_PI / 6 + (M_PI / 2 - M_PI / 6) * config.turning_notch / LEGEND_BAR_CELLS;
+}
+
+static double turn_limit(void) {
+    if (config.turning_notch >= LEGEND_BAR_CELLS) return 2 * M_PI;
+    double scaled = turning_notch_radians() * FRAME_RATE * flight_seconds();
+    return scaled > 2 * M_PI ? 2 * M_PI : scaled;
+}
+
+/*
+ * Hawks.
+ *
+ * A predator is what gives a clip a story: the flock splits, streams around it
+ * and closes again behind, which is the part people loop. A hawk is not a boid.
+ * It has no neighbours, obeys none of the three rules, and is kept out of the
+ * grid entirely, so the flocking maths is untouched by its existence: it simply
+ * chases the nearest bird and every bird flees it.
+ */
+typedef struct {
+    double x, y, direction;
+    int frame;
+    int prey;          /* Index of the bird it is chasing, negative for none. */
+    double commitment; /* Seconds before it may change its mind. */
+    double passing;    /* Seconds left of a straight run out of the flock. */
+    int wing;          /* A hawk soars, wings out, and beats them only in the dive. */
+    double wing_clock;
+    int layer;     /* In three dimensions, the size it is drawn at, as a bird's is. */
+    double stride; /* How far it flew in the last step, along its heading. */
+} hawk_t;
+
+static hawk_t hawks[MAX_HAWKS];
+/* The hawks' images always go up, so k can summon one at any time. */
+static int hawk_sets_built;
+
+/*
+ * The catalogue of sprite sets. One set is ROTATION_FRAMES images of one thing:
+ * a near bird of one shade at one wing phase; a far bird of one shade, wings out
+ * (it is too small to be seen flapping); a hawk at one wing phase; a ghost of a
+ * tail at one step of fading. Every renderer indexes the same catalogue, and a
+ * Kitty image id is the set's position times ROTATION_FRAMES plus the frame,
+ * plus one, because zero is not an id.
+ */
+enum {
+    MAX_SPRITE_SETS_FLAT = MAX_PALETTE_SHADES * (WING_PHASES + 1) + WING_PHASES + TRAIL_LENGTH,
+    /* A space has a hawk for every size as well as a bird, and the tails as before. */
+    MAX_SPRITE_SETS_SKY = SKY_BINS * (SKY_SHAPES + WING_PHASES) + TRAIL_LENGTH,
+    MAX_SPRITE_SETS =
+        MAX_SPRITE_SETS_FLAT > MAX_SPRITE_SETS_SKY ? MAX_SPRITE_SETS_FLAT : MAX_SPRITE_SETS_SKY
+};
+
+/* In three dimensions there is no far layer and no shade of the bird's own: what
+ * a bird looks like is how far off it is, one size and one tint for each of the
+ * camera's bins, and the wing beat on top. Every set after the flock's follows it
+ * wherever it ends. */
+static int flock_set_count(void) {
+    if (sky_mode) return SKY_BINS * SKY_SHAPES;
+    return palette_shades() * (WING_PHASES + 1);
+}
+
+static int flock_set(int shade, int wing, int layer) {
+    if (sky_mode) return layer * SKY_SHAPES + wing; /* The shape stands where the beat does. */
+    if (layer > 0) return palette_shades() * WING_PHASES + shade;
+    return shade * WING_PHASES + wing;
+}
+
+/* And a hawk is a set a size and a wing phase, the sizes in order. */
+static int hawk_set_count(void) {
+    return sky_mode ? SKY_BINS * WING_PHASES : WING_PHASES;
+}
+
+static int hawk_set(int wing) {
+    return flock_set_count() + wing;
+}
+
+static int trail_set(int step) {
+    return flock_set_count() + hawk_set_count() + step;
+}
+
+static int sprite_set_count(void) {
+    return trail_set(TRAIL_LENGTH);
+}
+
+static uint32_t set_image_id(int set, int frame) {
+    return (uint32_t)(set * ROTATION_FRAMES + frame) + 1;
+}
+
+/* What picks a bird's picture within its size: where it is in its beat, in the
+ * flat flock, and in a space its shape, which has the beat in it. */
+static int bird_wing(const bird_t *bird) {
+    return sky_mode ? bird->shape : WING_SEQUENCE[bird->wing % WING_CYCLE];
+}
+
+static uint32_t sprite_image_id(const bird_t *bird) {
+    return set_image_id(flock_set(bird->shade, bird_wing(bird), bird->layer), bird->frame);
+}
+
+/* Which of its sets a hawk is drawn from: the phase of its wings, and in a space
+ * the size that goes with how far off it is. */
+static int hawk_wing(const hawk_t *hawk) {
+    return (sky_mode ? hawk->layer * WING_PHASES : 0) + WING_SEQUENCE[hawk->wing % WING_CYCLE];
+}
+
+static int hawk_offset_of(const hawk_t *hawk) {
+    return sky_mode ? hawk_size_in_layer(hawk->layer) / 2 : hawk_draw_offset();
+}
+
+static uint32_t hawk_image_id(const hawk_t *hawk) {
+    return set_image_id(hawk_set(hawk_wing(hawk)), hawk->frame);
+}
+
+/* One hawk, so that summoning one with k leaves the hawks already hunting exactly
+ * where they are instead of teleporting the lot of them. */
+static void place_one_hawk(int i) {
+    hawks[i].x = screen.width * (i + 1.0) / (config.hawks + 1.0);
+    hawks[i].y = screen.height * (i % 2 ? 0.75 : 0.25);
+    hawks[i].direction = 2 * M_PI * random_unit();
+    hawks[i].frame = direction_frame(hawks[i].direction);
+    hawks[i].prey = -1;
+    hawks[i].commitment = 0;
+    hawks[i].passing = 0;
+    hawks[i].wing = 0;
+    hawks[i].wing_clock = 0;
+    hawks[i].stride = 0;
+}
+
+static void place_hawks(void) {
+    for (int i = 0; i < config.hawks; i++) place_one_hawk(i);
+}
+
+/* The nearest bird, by brute force: eight hawks against four thousand birds is a
+ * few tens of thousands of comparisons, well under a percent of a frame, and it
+ * needs no structure of its own. A hawk another hawk has already chosen is passed
+ * over when `unclaimed` is asked for: two silhouettes converging on one bird read
+ * as one hawk with a rendering fault, and they arrive on top of each other. */
+static int nearest_bird(const bird_t *birds, double x, double y, int self, int unclaimed,
+                        double no_nearer_than) {
+    int best = -1;
+    double best_distance = 0;
+    double floor_squared = no_nearer_than * no_nearer_than;
+    for (int b = 0; b < config.birds; b++) {
+        if (birds[b].layer > 0 || birds[b].perched) continue; /* Its own sky, and in the air. */
+        if (unclaimed) {
+            int taken = 0;
+            for (int h = 0; h < config.hawks && !taken; h++)
+                if (h != self && hawks[h].prey == b) taken = 1;
+            if (taken) continue;
+        }
+        double dx = birds[b].x - x, dy = birds[b].y - y;
+        double distance = dx * dx + dy * dy;
+        if (distance < floor_squared) continue;
+        if (best < 0 || distance < best_distance) {
+            best_distance = distance;
+            best = b;
+        }
+    }
+    return best;
+}
+
+static double distance_to_bird(const bird_t *birds, const hawk_t *hawk, int bird) {
+    double dx = birds[bird].x - hawk->x, dy = birds[bird].y - hawk->y;
+    return sqrt(dx * dx + dy * dy);
+}
+
+/* How near the hawk will pass its bird over the whole of this frame's travel, not
+ * merely where it stands now. At forty pixels a frame a hawk can pass clean
+ * through a bird between one frame and the next; the nearest point of the segment
+ * it is about to fly is what it actually reaches. */
+static double reach_along_the_step(const bird_t *birds, const hawk_t *hawk, int bird) {
+    double step = config.speed * HAWK_DIVE_SPEED;
+    double dx = birds[bird].x - hawk->x, dy = birds[bird].y - hawk->y;
+    double along = dx * cos(hawk->direction) + dy * sin(hawk->direction);
+    if (along < 0) along = 0;
+    if (along > step) along = step;
+    double near_x = hawk->x + along * cos(hawk->direction);
+    double near_y = hawk->y + along * sin(hawk->direction);
+    dx = birds[bird].x - near_x;
+    dy = birds[bird].y - near_y;
+    return sqrt(dx * dx + dy * dy);
+}
+
+/* Pick, or keep. A hawk holds on to its bird for a fixed time whatever
+ * else wanders past, and only when that runs out will it trade up, and then only
+ * for a bird a clear quarter closer than the one it is on. Without the hold it
+ * re-picked the nearest bird every frame, which in a dense flock means a different
+ * bird most frames: it turned on the spot and looked broken rather than hungry. */
+static void choose_prey(hawk_t *hawk, const bird_t *birds, int self) {
+    if (hawk->prey >= config.birds) hawk->prey = -1;
+    if (hawk->prey >= 0 && hawk->commitment > 0) return; /* Committed: hold on. */
+    /* And with the commitment spent, a chase that has not closed by now is over:
+     * the bird outran it, and there are five hundred others. */
+    if (hawk->prey >= 0 && distance_to_bird(birds, hawk, hawk->prey) > HAWK_GIVE_UP)
+        hawk->prey = -1;
+
+    /* And it picks its bird from outside the flock's own alarm radius, so there is
+     * a chase to watch: the nearest bird to a hawk that has just flown through the
+     * middle of a flock is one already beside it, and a strike with no approach is
+     * over before anybody sees it start. */
+    int candidate = nearest_bird(birds, hawk->x, hawk->y, self, 1, HAWK_STALK);
+    if (candidate < 0) candidate = nearest_bird(birds, hawk->x, hawk->y, self, 1, 0);
+    if (candidate < 0) candidate = nearest_bird(birds, hawk->x, hawk->y, self, 0, 0);
+    if (candidate < 0) return;
+    if (hawk->prey >= 0 &&
+        distance_to_bird(birds, hawk, candidate) > 0.75 * distance_to_bird(birds, hawk, hawk->prey))
+        return; /* Not enough of an improvement to be worth changing its mind. */
+    hawk->prey = candidate;
+    hawk->commitment = (double)HAWK_COMMITMENT_FRAMES / FRAME_RATE;
+}
+
+static double hawk_turn_limit(void) {
+    double limit = HAWK_TURN_PER_FRAME();
+    /* And never so lazy that it cannot turn inside the room it has: on a small
+     * terminal a turning circle wider than a third of the screen means the hawk
+     * is committed to the glass before it can see it, and it spends the run
+     * bouncing from wall to wall. */
+    double shorter = screen.width < screen.height ? screen.width : screen.height;
+    if (shorter > 0) {
+        double needed = config.speed * HAWK_DIVE_SPEED / (shorter / 3.0);
+        if (needed > limit) limit = needed;
+    }
+    return limit > M_PI ? M_PI : limit;
+}
+
+/* How tight a circle it can fly. */
+static double hawk_turning_radius(void) {
+    double limit = hawk_turn_limit();
+    return limit > 0 ? config.speed * HAWK_DIVE_SPEED / limit : 0;
+}
+
+/* And how far off it has to see a wall: a whole diameter, not a radius. A radius
+ * is the bare minimum to turn ninety degrees, and since the push starts at
+ * nothing at the band's edge the hawk was always committed before the push was
+ * worth anything — it reflected off the glass about once a second. Three gives it
+ * room to lean out of the turn instead of hauling on it. */
+static double hawk_wall_band(void) {
+    return hawk_turning_radius() * 3;
+}
+
+/* A wall, seen a turning circle ahead. Without this the hawk flew into the edge
+ * and reflected: a hundred and eighty degrees in one frame, three times a second,
+ * which is exactly what "buggy" looks like. Now it banks away like the flock does,
+ * and the reflection below is a safety net that almost never fires. */
+/* A hawk is turned from the text of a sign as the flock is, and less firmly than
+ * it is drawn to its prey, so it hunts round the sign with the river and crosses
+ * it when a chase takes it there. With the river and no turn, two hawks kept 11 to
+ * 13% of a sign's writers scattered on 800 birds at 96 by 26 cells, against 10 to
+ * 11% before the river, and on one machine 15%; turned at three quarters of the
+ * pull of the prey, 6 to 8%, and one hawk 3 to 5%. At one and a half a hawk all
+ * but never crossed, and a sign it never touches is a hawk that is not there. */
+static vector_t hawk_sign_vector(const hawk_t *hawk) {
+    vector_t push = {0, 0};
+    if (!formation.writing || !formation.keep_out) return push;
+    sign_box_push(&formation.box, sign_band(), hawk->x, hawk->y, &push.x, &push.y);
+    return push;
+}
+
+static vector_t hawk_wall_vector(const hawk_t *hawk) {
+    vector_t wall = {0, 0};
+    double band = hawk_wall_band();
+    /* Never more than a third of the room there is, or on a small terminal the two
+     * sides of the same axis would overlap and the nearer one would win
+     * everywhere: the hawk would be pushed one way from every position on the
+     * screen and end up pinned against the far edge. */
+    double band_x = band < screen.width / 3.0 ? band : screen.width / 3.0;
+    double band_y = band < screen.height / 3.0 ? band : screen.height / 3.0;
+    if (band_x >= 1) {
+        if (hawk->x < band_x && !open_edges.hawk_left)
+            wall.x = (band_x - hawk->x) / band_x;
+        else if (hawk->x > screen.width - band_x && !open_edges.hawk_right)
+            wall.x = -(hawk->x - (screen.width - band_x)) / band_x;
+    }
+    if (band_y >= 1) {
+        if (hawk->y < band_y)
+            wall.y = (band_y - hawk->y) / band_y;
+        else if (hawk->y > screen.height - band_y)
+            wall.y = -(hawk->y - (screen.height - band_y)) / band_y;
+    }
+    /* The panel is a wall as well. Every bird is forbidden from it and a hawk was
+     * not, so it flew over the sliders in a sixth of all frames: the one thing on
+     * the screen that is not sky, with something flying through it. It is steered
+     * around rather than forbidden, because a hawk that stopped dead at an edge
+     * nobody can see would look stranger than one that crosses it. */
+    if (screen.legend_width > 0 && hawk->x < screen.legend_width + band_x &&
+        hawk->y < screen.legend_height + band_y) {
+        double out_right = screen.legend_width + band_x - hawk->x;
+        double out_below = screen.legend_height + band_y - hawk->y;
+        if (out_right / band_x < out_below / band_y)
+            wall.x += out_right / band_x;
+        else
+            wall.y += out_below / band_y;
+    }
+    return wall;
+}
+
+/* Room for the other hawks: a nudge away from any hawk closer than HAWK_SPACING,
+ * so eight of them share a flock instead of flying as one thick smear. */
+static vector_t hawk_spacing(int self) {
+    vector_t apart = {0, 0};
+    for (int i = 0; i < config.hawks; i++) {
+        if (i == self) continue;
+        double dx = hawks[self].x - hawks[i].x, dy = hawks[self].y - hawks[i].y;
+        double squared = dx * dx + dy * dy;
+        if (squared >= (double)HAWK_SPACING * HAWK_SPACING || squared < 1e-9) continue;
+        double distance = sqrt(squared);
+        /* Unanswerable at contact rather than merely firm: a push that fades to
+         * nothing as they touch is a push that lets two hawks overlap, which is
+         * the one thing this rule exists to prevent. */
+        double strength = HAWK_SPACING / distance - 1;
+        apart.x += strength * dx / distance;
+        apart.y += strength * dy / distance;
+    }
+    return apart;
+}
+
+/*
+ * The chase.
+ *
+ * A hawk aims where its bird is going rather than where it is, which is what makes
+ * the pursuit look intelligent instead of trailing. It banks: a limit on the turn
+ * per step, looser than a bird's because a raptor is more agile, but a limit all
+ * the same. Inside HAWK_DIVE it stops leading, goes straight at the bird and
+ * accelerates, because a fleeing bird is only a tenth slower than a cruising hawk
+ * and without that last push the gap never closes and there is nothing to watch.
+ *
+ * Then it is through them, and flies straight for a short time before turning
+ * back: that exit is the half of a stoop that makes the flock close up behind.
+ */
+static void hunt(const bird_t *birds) {
+    if (sky_mode) return; /* The hunt is the space's own, in the flight. */
+    for (int i = 0; i < config.hawks; i++) {
+        hawk_t *hawk = &hawks[i];
+        if (hawk->commitment > 0) {
+            hawk->commitment -= flight_seconds();
+            if (hawk->commitment < 0) hawk->commitment = 0;
+        }
+
+        if (hawk->passing > 0) {
+            hawk->passing -= flight_seconds();
+            if (hawk->passing < 0) hawk->passing = 0;
+            hawk->prey = -1;
+        } else {
+            /* A pass is being among them, not catching the one it set out after:
+             * the bird it chose is fleeing, so what it actually flies through is
+             * whichever birds are there when it arrives. */
+            /* How near it has to get: two silhouettes, and no wider. Widening it
+             * to a frame's travel made the strike distance depend on the frame
+             * rate — six times as many strikes at --fps 30 as at 60 — so instead
+             * the whole of this frame's travel is tested below, which is the same
+             * thing without the arithmetic depending on how fast the clock runs. */
+            double arrived = config.bird_size * 2;
+            /* Its own bird, and only its own bird. Counting whatever else it
+             * happened to pass close to ended nine chases in ten before they were
+             * chases: the strike fired the frame the dive began, sixty pixels from
+             * the bird it had chosen, and the commitment, the lead and the dive
+             * were all dead letters. */
+            int struck = hawk->prey >= 0 && hawk->prey < config.birds &&
+                         reach_along_the_step(birds, hawk, hawk->prey) < arrived;
+            if (struck) {
+                hawk->prey = -1;
+                hawk->commitment = 0;
+                hawk->passing = (double)HAWK_PASS_FRAMES / FRAME_RATE;
+            } else {
+                choose_prey(hawk, birds, i);
+            }
+        }
+
+        double pace = HAWK_SPEED;
+        vector_t apart = hawk_spacing(i);
+        vector_t wall = hawk_wall_vector(hawk);
+        vector_t text = hawk_sign_vector(hawk);
+        double want_x = apart.x * HAWK_APART + wall.x * HAWK_WALL + text.x * HAWK_SIGN;
+        double want_y = apart.y * HAWK_APART + wall.y * HAWK_WALL + text.y * HAWK_SIGN;
+        if (hawk->prey >= 0) {
+            const bird_t *prey = &birds[hawk->prey];
+            double gap = distance_to_bird(birds, hawk, hawk->prey);
+            if (gap < HAWK_DIVE) pace = HAWK_DIVE_SPEED;
+            /* It soars until the dive, and then it beats. */
+            if (gap < HAWK_DIVE || hawk->passing > 0) {
+                hawk->wing_clock += WING_HZ * WING_CYCLE * frame_seconds;
+                while (hawk->wing_clock >= 1.0) {
+                    hawk->wing_clock -= 1.0;
+                    hawk->wing = (hawk->wing + 1) % WING_CYCLE;
+                }
+            } else {
+                hawk->wing = 0;
+            }
+            /* Aim where the bird will be when the hawk gets there, not a fixed
+             * distance ahead: close in, that is almost no lead at all, and a fixed
+             * one had it cutting across in front of the bird and out the far side,
+             * round and round. Never further ahead than three baseline steps,
+             * because past that the guess is worth less than the chase. */
+            double lead = gap / pace;
+            if (lead > HAWK_LEAD_DISTANCE) lead = HAWK_LEAD_DISTANCE;
+            double to_x = prey->x + cos(prey->direction) * lead - hawk->x;
+            double to_y = prey->y + sin(prey->direction) * lead - hawk->y;
+            double reach = sqrt(to_x * to_x + to_y * to_y);
+            if (reach > 1e-9) {
+                want_x += to_x / reach;
+                want_y += to_y / reach;
+            }
+        }
+        if (want_x * want_x + want_y * want_y > 1e-9)
+            hawk->direction =
+                turn_towards(hawk->direction, normalized_angle(want_y, want_x), hawk_turn_limit());
+
+        hawk->stride = config.speed * pace;
+        hawk->x += hawk->stride * cos(hawk->direction);
+        hawk->y += hawk->stride * sin(hawk->direction);
+
+        /* Turned back at the walls rather than pinned against them: a clamp left
+         * it sliding along an edge for a quarter of every run. The margin is half
+         * its own silhouette, so it turns while it is still wholly on the screen —
+         * clamping to the screen edge instead put the sprite's far half outside it,
+         * and a placement that does not fit is a placement the terminal drops, so
+         * every wall cost a one frame blink. */
+        double margin = hawk_draw_offset();
+        double last_x = screen.width - 1 - margin, last_y = screen.height - 1 - margin;
+        if (last_x < margin) last_x = margin;
+        if (last_y < margin) last_y = margin;
+        /* Not at a door: it flies on through, and is posted once it is out. */
+        if ((hawk->x < margin && !open_edges.hawk_left) ||
+            (hawk->x > last_x && !open_edges.hawk_right)) {
+            hawk->x = hawk->x < margin ? margin : last_x;
+            hawk->direction = normalized_angle(sin(hawk->direction), -cos(hawk->direction));
+            hawk->prey = -1; /* Whatever it was after, it is not that way now. */
+            hawk->commitment = 0;
+            hawk->passing = 0;
+        }
+        if (hawk->y < margin || hawk->y > last_y) {
+            hawk->y = hawk->y < margin ? margin : last_y;
+            hawk->direction = normalized_angle(-sin(hawk->direction), cos(hawk->direction));
+            hawk->prey = -1;
+            hawk->commitment = 0;
+            hawk->passing = 0;
+        }
+        hawk->frame = direction_frame(hawk->direction);
+    }
+}
+
+/* How far a hawk's alarm carries. Never more than a third of the shorter side of
+ * the screen: eight hawks with a hundred and fifty pixel reach on a terminal three
+ * hundred pixels wide leave the flock nowhere at all to be, and it spends its time
+ * pressed against the edges. */
+static double hawk_reach(void) {
+    double shorter = screen.width < screen.height ? screen.width : screen.height;
+    double fits = shorter / 3.0;
+    return HAWK_REACH < fits ? HAWK_REACH : fits;
+}
+
+/* Every bird flees every hawk in reach, hardest when it is closest, and not
+ * straight away from it: part of the flee is sideways, around the hawk, on
+ * whichever side the bird is already heading. Straight away and the flock bursts
+ * open and is simply gone; around, and it opens, streams past and closes behind,
+ * which is the shape worth recording. */
+static vector_t hawk_vector(const bird_t *bird) {
+    vector_t force = {0, 0};
+    if (bird->layer > 0) return force; /* Another sky; nothing to fear. */
+    for (int i = 0; i < config.hawks; i++) {
+        double reach = hawk_reach();
+        double dx = bird->x - hawks[i].x, dy = bird->y - hawks[i].y;
+        double squared = dx * dx + dy * dy;
+        if (squared >= reach * reach || squared < 1e-9) continue;
+        double distance = sqrt(squared);
+        double strength = (reach - distance) / reach;
+        double away_x = dx / distance, away_y = dy / distance;
+        /* One of the two ways round; the one the bird is already turning. */
+        double side_x = -away_y, side_y = away_x;
+        if (cos(bird->direction) * side_x + sin(bird->direction) * side_y < 0) {
+            side_x = -side_x;
+            side_y = -side_y;
+        }
+        force.x += strength * (away_x + HAWK_SWIRL * side_x);
+        force.y += strength * (away_y + HAWK_SWIRL * side_y);
+    }
+    return force;
+}
+
+/* Each flock flies at its own pace, the first at full speed and the last at
+ * seven eighths of it. Two flocks at identical speeds pass through each other and
+ * come out symmetrical; a little apart and they shear, overtake and tangle, which
+ * is the part that looks alive. Small enough that nobody reads it as a bug. */
+static double flock_pace(int flock) {
+    if (config.flocks <= 1) return 1.0;
+    return 1.0 - (1 - config.avoid_kinship) * 0.125 * flock / (config.flocks - 1);
+}
+
+/* Where each flock is, measured once a frame off the same snapshot every bird
+ * reads, so every bird in a flock agrees about where its flock is. */
+static double flock_center_x[MAX_FLOCKS], flock_center_y[MAX_FLOCKS];
+/* Where each flock is told to be: its own centre, shoved clear of the others
+ * when the avoidance is above the default. */
+static double flock_home_x[MAX_FLOCKS], flock_home_y[MAX_FLOCKS];
+/* How far a bird may stray from home before the leash pulls: see FLOCK_LEASH. */
+static double flock_leash[MAX_FLOCKS];
+
+/* A flock's shade: the ramp's ends first, then the space between them, so two
+ * flocks come out as far apart as the palette allows instead of as shade zero and
+ * shade one, which on any five step ramp are nearly the same colour. */
+static int shade_for_flock(int flock) {
+    int shades = palette_shades();
+    if (shades <= 1 || config.flocks <= 1) return 0;
+    int spread = flock * (shades - 1) / (config.flocks - 1);
+    return spread >= shades ? shades - 1 : spread;
+}
+
+/* One bird, so that growing the flock at runtime places only the new ones. */
+static void place_one_bird(bird_t *bird, int index) {
+    /* A bird starts from nothing: the memory a + grows the flock into is
+     * whatever the allocator left there, and the tail index is read as an array
+     * index the moment trails are on. */
+    *bird = (bird_t){0};
+    double min_x = screen.turn_x, max_x = screen.width - screen.turn_x;
+    double min_y = screen.turn_y, max_y = screen.height - screen.turn_bottom;
+    if (max_x <= min_x) min_x = max_x = screen.width / 2.0;
+    if (max_y <= min_y) min_y = max_y = screen.height / 2.0;
+
+    /* Flocks are handed out round robin so they come out even. Each one starts in
+     * its own column of the screen, because scattered evenly they begin as one
+     * speckled cloud and take half a minute to sort themselves out; started apart
+     * they read as separate flocks from the first frame and then go and meet. */
+    bird->flock = index % config.flocks;
+    if (config.flocks > 1) {
+        double band = (max_x - min_x) / config.flocks;
+        min_x += band * bird->flock;
+        max_x = min_x + band;
+        /* Unless that flock is already flying somewhere, in which case a bird
+         * added with + joins it there rather than appearing in the column it
+         * started in a minute ago and being dragged across the screen. */
+        if (flock_home_x[bird->flock] != 0 || flock_home_y[bird->flock] != 0) {
+            min_x = flock_home_x[bird->flock] - FLOCK_LEASH / 2.0;
+            max_x = min_x + FLOCK_LEASH;
+            min_y = flock_home_y[bird->flock] - FLOCK_LEASH / 2.0;
+            max_y = min_y + FLOCK_LEASH;
+        }
+    }
+
+    /* Rejected rather than clamped, so the whole free region stays in play
+     * instead of the flock piling up along one edge of the panel. Bounded, with a
+     * deterministic fallback below the panel, because on a small viewport the
+     * free region can be almost entirely covered. */
+    for (int attempt = 0;; attempt++) {
+        bird->x = min_x + (max_x - min_x) * random_unit();
+        bird->y = min_y + (max_y - min_y) * random_unit();
+        if (!legend_turn_zone(bird->x, bird->y)) break;
+        if (attempt + 1 >= SPAWN_ATTEMPTS) {
+            bird->y = screen.legend_height + config.speed + 1;
+            if (bird->y > max_y) bird->x = screen.legend_width + config.speed + 1;
+            break;
+        }
+    }
+    bird->direction = 2 * M_PI * random_unit();
+    bird->frame = direction_frame(bird->direction);
+    /* A plane of its own, and a place in the beat of its own, or every wing in
+     * the sky would go up and down together. */
+    bird->layer = deep_look && random_unit() < FAR_SHARE ? 1 : 0;
+    bird->wing = (int)(random_unit() * WING_CYCLE) % WING_CYCLE;
+    bird->wing_clock = random_unit();
+    bird->gliding = 0;
+    /* When there is more than one flock the palette follows them: a colour per
+     * flock is what makes two of them legible as two. */
+    bird->shade = config.flocks > 1 ? shade_for_flock(bird->flock)
+                                    : (int)(random_unit() * palette_shades()) % palette_shades();
+}
+
+static void place_the_letters(bird_t *birds);
+static void begin_the_sky(bird_t *birds);
+static int grow_the_sky(int from, int to);
+
+static void initialize_birds(bird_t *birds) {
+    if (letters_mode) {
+        place_the_letters(birds);
+        return;
+    }
+    if (sky_mode) {
+        begin_the_sky(birds);
+        return;
+    }
+    for (int i = 0; i < config.birds; i++) place_one_bird(&birds[i], i);
+}
+
+/* How many birds the arrays have room for when `wanted` are flying. A window in a
+ * shared sky takes birds in between one key and the next, so it has room for all
+ * it could ever hold from the start, and never has to grow in the middle of a
+ * frame; the few hundred kilobytes that cost are nothing next to the sprites. */
+static int bird_room(int wanted) {
+    return share_the_sky ? MAX_BIRDS : wanted;
+}
+
+/* The grid will not be prepared for nothing, and a window in a shared sky may be
+ * empty for a while: it is prepared for one, which it never uses. */
+static int grid_items(void) {
+    return config.birds > 0 ? config.birds : 1;
+}
+
+/* Grown or shrunk by a keypress: the birds already flying carry on and only the
+ * new ones are placed. Both arrays change or neither does. A realloc each could
+ * leave one resized and the other not, and one count cannot describe two
+ * lengths, so both are built new and swapped in only once both exist. */
+static int resize_the_flock(bird_t **birds, bird_t **snapshot, int from, int to) {
+    bird_t *grown = malloc(sizeof(**birds) * (size_t)bird_room(to));
+    bird_t *grown_snapshot = malloc(sizeof(**snapshot) * (size_t)bird_room(to));
+    if (grown == NULL || grown_snapshot == NULL) {
+        free(grown);
+        free(grown_snapshot);
+        return 0;
+    }
+    if (sky_mode && !grow_the_sky(from, to)) {
+        free(grown);
+        free(grown_snapshot);
+        return 0;
+    }
+    memcpy(grown, *birds, sizeof(**birds) * (size_t)(from < to ? from : to));
+    for (int i = from; i < to; i++) place_one_bird(&grown[i], i);
+    free(*birds);
+    free(*snapshot);
+    *birds = grown;
+    *snapshot = grown_snapshot;
+    return 1;
+}
+
+/*
+ * The pointer, as a thing in the world.
+ *
+ * flee is the default because it is the one that explains itself: the flock
+ * parts around the cursor within a second of the viewer moving it, and nobody
+ * has to be told what happened. follow is the opposite and makes the pointer a
+ * feeder.
+ *
+ * The force falls off with distance rather than being a hard wall like the
+ * panel's, because the flock has to bend around the pointer and close again
+ * behind it, not bounce off it.
+ */
+static vector_t pointer_vector(const bird_t *bird) {
+    vector_t force = {0, 0};
+    if (!mouse.present) return force;
+
+    double dx = bird->x - mouse.x, dy = bird->y - mouse.y;
+    double squared = dx * dx + dy * dy;
+    double reach = MOUSE_REACH;
+    if (squared >= reach * reach || squared < 1e-9) return force;
+
+    double distance = sqrt(squared);
+    /* One at the pointer, nothing at the edge of its reach. */
+    double strength = (reach - distance) / reach;
+
+    force.x = strength * dx / distance;
+    force.y = strength * dy / distance;
+    return force;
+}
+
+/*
+ * How hard an edge pushes, given how far into its band a bird has gone.
+ *
+ * This used to be a flat 1 anywhere in the band, which is why most of the flock
+ * ended up off screen: a constant push loses to a strong enough alignment, and
+ * once it has lost there is nothing stronger further out to win it back. It now
+ * grows, gently through the band and then steeply past the edge of the screen,
+ * so leaving is always possible and staying away never is.
+ */
+static double edge_push(double past, double band) {
+    if (past <= 0) return 0;
+    double depth = past / band; /* Zero at the band's inner edge, one at the screen's. */
+    if (depth <= 1) return EDGE_FIRM * depth * depth;
+    /* Past the screen itself the weight stops having a vote: the softest boundary
+     * is still a boundary. Dividing it out here means the push a bird feels once
+     * it is out of sight is the same at notch 0 as at notch 12, so a low boundary
+     * makes them turn late rather than leave. Carrying the weight in the first
+     * term keeps the whole thing continuous at the edge: without it the push
+     * jumped by a factor of a hundred at notch 0 and a bird was slapped rather
+     * than turned. */
+    return EDGE_FIRM * (config.boundary + (depth - 1) * ESCAPE_PENALTY) / config.boundary;
+}
+
+static vector_t boundary_vector(const bird_t *bird) {
+    vector_t boundary = {0, 0};
+    if (legend_repels(bird, &boundary)) return boundary;
+    if (the_rain_is_falling) return boundary; /* A door, so no wall. */
+    /* An edge with a neighbour behind it pushes nothing: there is no wall there to
+     * turn away from, and a band would keep the flock from the door. Except for a
+     * bird of a sign that has been scattered, which is the sign's and does not
+     * cross: for it the edge is the wall it is alone, or the hawk that blew it out
+     * would take it past the door and leave a hole in the letters for as long as it
+     * takes to come home. Only a bird of a sign has been scattered. */
+    int stays = bird->scattered > 0;
+    if (bird->x < screen.turn_x && (!open_edges.left || stays))
+        boundary.x = edge_push(screen.turn_x - bird->x, screen.turn_x);
+    else if (bird->x > screen.width - screen.turn_x && (!open_edges.right || stays))
+        boundary.x = -edge_push(bird->x - (screen.width - screen.turn_x), screen.turn_x);
+    if (bird->y < screen.turn_y)
+        boundary.y = edge_push(screen.turn_y - bird->y, screen.turn_y);
+    else if (bird->y > screen.height - screen.turn_bottom)
+        boundary.y = -edge_push(bird->y - (screen.height - screen.turn_bottom), screen.turn_bottom);
+    return boundary;
+}
+
+/* How much room one flock asks of another: two leashes, or nearly the whole of
+ * the shorter side of the screen when that is less, so that on a small viewport
+ * the flocks are not all shoved into the corners. It is an ask, not a promise:
+ * five flocks cannot all be three hundred pixels apart on a screen four hundred
+ * pixels tall, and what they settle at is as far apart as there is room for. */
+static double flock_room(void) {
+    double room = 2.0 * FLOCK_LEASH * config.avoid_room;
+    double shorter = screen.width < screen.height ? screen.width : screen.height;
+    double fits = 0.9 * shorter;
+    return room < fits ? room : fits;
+}
+
+static void measure_flocks(const bird_t *birds) {
+    int counted[MAX_FLOCKS] = {0};
+    for (int f = 0; f < MAX_FLOCKS; f++) {
+        flock_center_x[f] = flock_center_y[f] = 0;
+        flock_home_x[f] = flock_home_y[f] = 0;
+    }
+    if (config.flocks <= 1) return;
+    for (int i = 0; i < config.birds; i++) {
+        int flock = birds[i].flock;
+        if (flock < 0 || flock >= MAX_FLOCKS) continue;
+        flock_center_x[flock] += birds[i].x;
+        flock_center_y[flock] += birds[i].y;
+        counted[flock]++;
+    }
+    for (int f = 0; f < MAX_FLOCKS; f++) {
+        if (counted[f] > 0) {
+            flock_center_x[f] /= counted[f];
+            flock_center_y[f] /= counted[f];
+        }
+        double width = LEASH_PER_ROOT_BIRD * sqrt((double)counted[f]);
+        flock_leash[f] = width > FLOCK_LEASH ? width : FLOCK_LEASH;
+    }
+
+    /* Left to themselves the three centres of gravity drift to the middle of the
+     * screen and sit on top of each other, and three flocks become one cloud in
+     * three colours. So each flock is sent home to its own centre moved clear of
+     * every other flock's: they shoulder each other apart, find their own corners
+     * of the sky and keep them, without any of it being on rails. */
+    double room = flock_room();
+    for (int f = 0; f < config.flocks && f < MAX_FLOCKS; f++) {
+        flock_home_x[f] = flock_center_x[f];
+        flock_home_y[f] = flock_center_y[f];
+        if (counted[f] == 0) continue;
+        double shove_x = 0, shove_y = 0;
+        int crowding = 0;
+        for (int g = 0; g < config.flocks && g < MAX_FLOCKS; g++) {
+            if (g == f || counted[g] == 0) continue;
+            double dx = flock_center_x[f] - flock_center_x[g];
+            double dy = flock_center_y[f] - flock_center_y[g];
+            double distance = sqrt(dx * dx + dy * dy);
+            if (distance >= room) continue;
+            if (distance < 1e-9) {
+                /* Exactly on top of one another: pick a direction rather than
+                 * dividing by nothing, one for each flock, and let them unfold. */
+                double angle = 2 * M_PI * f / config.flocks;
+                dx = cos(angle);
+                dy = sin(angle);
+                distance = 1;
+            }
+            shove_x += (room - distance) * dx / distance;
+            shove_y += (room - distance) * dy / distance;
+            crowding++;
+        }
+        /* The sum of the shoves, but never further than one room's worth of it:
+         * four flocks all pushing the middle one used to throw its home two
+         * hundred pixels clear off the screen, where the leash drags the flock
+         * into an edge that is pushing back just as hard. Averaging instead was
+         * worse — in a row of three the two outer shoves on the middle flock
+         * oppose each other, and an average of opposites is nothing at all. */
+        if (crowding > 0) {
+            double shove = sqrt(shove_x * shove_x + shove_y * shove_y);
+            if (shove > room) {
+                shove_x = shove_x * room / shove;
+                shove_y = shove_y * room / shove;
+            }
+            flock_home_x[f] += shove_x;
+            flock_home_y[f] += shove_y;
+        }
+        /* And home is somewhere a flock can actually be. */
+        if (flock_home_x[f] < 0) flock_home_x[f] = 0;
+        if (flock_home_y[f] < 0) flock_home_y[f] = 0;
+        if (flock_home_x[f] > screen.width) flock_home_x[f] = screen.width;
+        if (flock_home_y[f] > screen.height) flock_home_y[f] = screen.height;
+    }
+}
+
+/* The leash: nothing within the flock's own width of home, and outside that a
+ * pull that grows with the distance. It lets go as strangers become kin, cubed so
+ * that it is all but gone by the time they are half kin: a flock tied to its own
+ * centre while it mixes with another is two knots in one cloud. */
+static vector_t leash_vector(const bird_t *bird) {
+    vector_t pull = {0, 0};
+    if (config.flocks <= 1 || bird->flock < 0 || bird->flock >= MAX_FLOCKS) return pull;
+    double dx = flock_home_x[bird->flock] - bird->x;
+    double dy = flock_home_y[bird->flock] - bird->y;
+    double distance = sqrt(dx * dx + dy * dy);
+    double width = flock_leash[bird->flock] > 0 ? flock_leash[bird->flock] : FLOCK_LEASH;
+    if (distance <= width || distance < 1e-9) return pull;
+    double strength = (distance - width) / width;
+    if (strength > 1) strength = 1;
+    double apart = 1 - config.avoid_kinship;
+    strength *= apart * apart * apart;
+    pull.x = strength * dx / distance;
+    pull.y = strength * dy / distance;
+    return pull;
+}
+
+static void read_bird_position(const void *context, int index, double *x, double *y) {
+    const bird_t *birds = context;
+    *x = birds[index].x;
+    *y = birds[index].y;
+}
+
+static double flock_direction(const bird_t *birds, const spatial_grid_t *grid, int target_index) {
+    const bird_t *target = &birds[target_index];
+    double want_x, want_y;
+    /* Writing overrules flocking while it lasts: a bird with a target steers at
+     * it and nothing else, which is what makes a letter a letter. */
+    if (formation_target_for(target, target_index, &want_x, &want_y)) {
+        double to_x = want_x - target->x, to_y = want_y - target->y;
+        if (to_x * to_x + to_y * to_y > 1e-9) return normalized_angle(to_y, to_x);
+        return target->direction;
+    }
+    vector_t separation = {0, 0}, alignment = {0, 0}, cohesion = {0, 0}, wary = {0, 0};
+    vector_t boundary = boundary_vector(target);
+    vector_t leash = leash_vector(target);
+    vector_t pointer = pointer_vector(target);
+    vector_t hawk = hawk_vector(target);
+    vector_t wind = wind_vector();
+    vector_t keep_out = sign_keep_out_vector(target);
+    vector_t orbit = sign_orbit_vector(target);
+    int neighbors = 0, strangers = 0;
+    double kin = 0; /* Counted in kinship: a whole bird for its own flock. */
+    int center_x, center_y;
+    spatial_grid_cell_for_position(grid, target->x, target->y, &center_x, &center_y);
+    int min_x = center_x - config.vision_cells;
+    int max_x = center_x + config.vision_cells;
+    int min_y = center_y - config.vision_cells;
+    int max_y = center_y + config.vision_cells;
+    if (min_x < 0) min_x = 0;
+    if (min_y < 0) min_y = 0;
+    if (max_x >= grid->columns) max_x = grid->columns - 1;
+    if (max_y >= grid->rows) max_y = grid->rows - 1;
+
+    for (int cell_y = min_y; cell_y <= max_y; cell_y++) {
+        for (int cell_x = min_x; cell_x <= max_x; cell_x++) {
+            int cell = cell_y * grid->columns + cell_x;
+            for (int slot = grid->offsets[cell]; slot < grid->offsets[cell + 1]; slot++) {
+                int i = grid->indices[slot];
+                if (i == target_index) continue;
+                const bird_t *other = &birds[i];
+                double dx = target->x - other->x, dy = target->y - other->y;
+                if (dx * dx + dy * dy >= config.vision_radius_squared) continue;
+                /* The far layer is another sky: a bird sees nothing in the other. A
+                 * letter at home is not in the air at all. */
+                if (other->layer != target->layer || other->perched) continue;
+                /* Separation is physical and applies to every bird in reach.
+                 * Alignment and cohesion are social, and a bird only reads its
+                 * own flock: two flocks pass through each other, swirl, and
+                 * refuse to merge. With one flock every neighbour is kin and the
+                 * arithmetic is exactly what it was. */
+                separation.x += dx;
+                separation.y += dy;
+                neighbors++;
+                if (other->flock != target->flock) {
+                    /* Kin in part, below the default: its heading and place count
+                     * for that share of a bird of the flock's own. */
+                    if (config.avoid_kinship > 0) {
+                        trig_entry_t heading = trig_lookup(other->direction);
+                        alignment.x += config.avoid_kinship * heading.cosine;
+                        alignment.y += config.avoid_kinship * heading.sine;
+                        cohesion.x += config.avoid_kinship * other->x;
+                        cohesion.y += config.avoid_kinship * other->y;
+                        kin += config.avoid_kinship;
+                    }
+                    /* Away from a stranger, hardest when it is nearest, as the
+                     * pointer is felt; averaged below, so a front of them weighs
+                     * what one does and the weight alone says how much. */
+                    if (config.avoid_weight > 0) {
+                        double distance = sqrt(dx * dx + dy * dy);
+                        if (distance > 1e-9) {
+                            double strength = 1 - distance / config.vision_radius;
+                            wary.x += strength * dx / distance;
+                            wary.y += strength * dy / distance;
+                            strangers++;
+                        }
+                    }
+                    continue;
+                }
+                trig_entry_t heading = trig_lookup(other->direction);
+                alignment.x += heading.cosine;
+                alignment.y += heading.sine;
+                cohesion.x += other->x;
+                cohesion.y += other->y;
+                kin += 1;
+            }
+        }
+    }
+    if (neighbors) {
+        if (kin != 0) {
+            alignment.x /= kin;
+            alignment.y /= kin;
+            cohesion.x = cohesion.x / kin - target->x;
+            cohesion.y = cohesion.y / kin - target->y;
+        }
+        if (strangers) {
+            wary.x /= strangers;
+            wary.y /= strangers;
+        }
+        double x = separation.x * config.separation + alignment.x * config.alignment +
+                   cohesion.x * COHESION_W + boundary.x * config.boundary + leash.x * LEASH_WEIGHT +
+                   pointer.x * MOUSE_WEIGHT + hawk.x * HAWK_WEIGHT + wind.x * WIND_WEIGHT +
+                   wary.x * config.avoid_weight + keep_out.x * SIGN_KEEP_OUT_WEIGHT + orbit.x;
+        double y = separation.y * config.separation + alignment.y * config.alignment +
+                   cohesion.y * COHESION_W + boundary.y * config.boundary + leash.y * LEASH_WEIGHT +
+                   pointer.y * MOUSE_WEIGHT + hawk.y * HAWK_WEIGHT + wind.y * WIND_WEIGHT +
+                   wary.y * config.avoid_weight + keep_out.y * SIGN_KEEP_OUT_WEIGHT + orbit.y;
+        return x == 0 && y == 0 ? target->direction : normalized_angle(y, x);
+    }
+    boundary.x = boundary.x * config.boundary + leash.x * LEASH_WEIGHT + pointer.x * MOUSE_WEIGHT +
+                 hawk.x * HAWK_WEIGHT + wind.x * WIND_WEIGHT + keep_out.x * SIGN_KEEP_OUT_WEIGHT +
+                 orbit.x;
+    boundary.y = boundary.y * config.boundary + leash.y * LEASH_WEIGHT + pointer.y * MOUSE_WEIGHT +
+                 hawk.y * HAWK_WEIGHT + wind.y * WIND_WEIGHT + keep_out.y * SIGN_KEEP_OUT_WEIGHT +
+                 orbit.y;
+    if (boundary.x != 0 || boundary.y != 0) {
+        double x = cos(target->direction) + boundary.x;
+        double y = sin(target->direction) + boundary.y;
+        if (x != 0 || y != 0) return normalized_angle(y, x);
+    }
+    return target->direction;
+}
+
+/*
+ * What decides a bird's shade within the ramp, and it is not a setting: one flock
+ * is coloured by heading, and more than one by flock, because those are the two
+ * answers anybody wanted.
+ *
+ * There used to be a --color-by with four modes and a key to cycle them. Two of
+ * them were the same thing — colouring by flock is what a flock is given at birth
+ * anyway — one painted two thirds of a default flock in the single darkest shade
+ * of the ramp and got worse the more birds there were, and the fourth is this.
+ *
+ * Heading is the striking one: a turn runs a ripple of colour through the whole
+ * flock, because neighbours that agree on a heading agree on a colour.
+ */
+static int shade_for(const bird_t *bird) {
+    int shades = palette_shades();
+    if (shades <= 1) return 0;
+    if (config.flocks > 1) return shade_for_flock(bird->flock);
+
+    double turns = normalized_angle(sin(bird->direction), cos(bird->direction)) / (2 * M_PI);
+    /* Folded at the half turn, because a heading is a circle and a ramp is a line:
+     * laid straight on to it, two birds a degree apart either side of due east got
+     * the two ends of the palette, and the flock came out salted with dark speckle
+     * that no turn of it explained. Folded, the two ways round meet in the middle
+     * and the colour runs smoothly with the heading; opposite headings share a
+     * shade, which nobody can see, and the seam, which everybody could, is gone. */
+    double folded = turns < 0.5 ? turns * 2 : (1 - turns) * 2;
+    int shade = (int)(folded * shades);
+    return shade >= shades ? shades - 1 : shade;
+}
+
+/* Off one edge and back on the other. The edges stop pushing back when this is
+ * on, because a wall and a door in the same place is neither. */
+static void wrap_position(bird_t *bird) {
+    double width = screen.width, height = screen.height;
+    /* An edge that is a door to another window is not also a way round. */
+    if (bird->x < 0 && !open_edges.left) bird->x += width;
+    if (bird->x >= width && !open_edges.right) bird->x -= width;
+    if (bird->y < 0) bird->y += height;
+    if (bird->y >= height) bird->y -= height;
+}
+
+/* One frame of wing: the clock runs at WING_HZ beats a second whatever the frame
+ * rate, and a bird that has just finished a beat sometimes stops to glide. */
+static void beat_wings(bird_t *bird) {
+    if (bird->gliding > 0) {
+        bird->gliding -= frame_seconds;
+        if (bird->gliding < 0) bird->gliding = 0;
+        bird->wing = 0;
+        return;
+    }
+    bird->wing_clock += WING_HZ * WING_CYCLE * frame_seconds;
+    while (bird->wing_clock >= 1.0) {
+        bird->wing_clock -= 1.0;
+        bird->wing = (bird->wing + 1) % WING_CYCLE;
+        if (bird->wing == 0 && random_unit() < GLIDE_CHANCE) {
+            double seconds =
+                GLIDE_SECONDS_MIN + (GLIDE_SECONDS_MAX - GLIDE_SECONDS_MIN) * random_unit();
+            bird->gliding = seconds;
+        }
+    }
+}
+
+static int pointer_is_moving(void) {
+    return mouse.present && clock_state.seconds - mouse.moved_at < POINTER_MOVING_SECONDS;
+}
+
+/* Whether the place is under a hawk: within HAWK_SCATTER of the way to where the
+ * flock starts to flee it of anywhere the hawk was in the last step. At the shipped
+ * pace a hawk flies 23 pixels a frame at 60 frames a second and 56 at 25, against a
+ * reach of 11, and a point test saw only the places it stood over at the end of a
+ * frame: through a line of letters it scattered 21% of the writers live and 10% in
+ * a recording. The step it flew is a segment. */
+static int a_hawk_is_over(double x, double y) {
+    double reach = HAWK_SCATTER * hawk_reach();
+    for (int i = 0; i < config.hawks; i++) {
+        double along_x = cos(hawks[i].direction), along_y = sin(hawks[i].direction);
+        double dx = x - hawks[i].x, dy = y - hawks[i].y;
+        /* Where on the step the place is nearest: the end of it, the start, or between. */
+        double behind = dx * along_x + dy * along_y;
+        if (behind > 0) behind = 0;
+        if (behind < -hawks[i].stride) behind = -hawks[i].stride;
+        double off_x = dx - behind * along_x, off_y = dy - behind * along_y;
+        if (off_x * off_x + off_y * off_y < reach * reach) return 1;
+    }
+    return 0;
+}
+
+/* How long a bird of a sign has still to stay away: the pointer, while it moves,
+ * and a hawk, while it is over, scatter every bird whose place they reach, and
+ * the birds come home when they have gone. A hawk that flew through a sign and
+ * moved nothing would look like a fault. */
+static double sign_scatter_left(const bird_t *was, int index) {
+    if (!formation.writing) return 0;
+    double left = was->scattered - frame_seconds;
+    if (left < 0) left = 0;
+    int target = index >= 0 && index < MAX_BIRDS ? formation.slot[index] : -1;
+    if (target < 0) return left;
+    double staying = 0;
+    if (pointer_is_moving()) {
+        double dx = formation.x[target] - mouse.x, dy = formation.y[target] - mouse.y;
+        if (dx * dx + dy * dy < (double)MOUSE_REACH * MOUSE_REACH)
+            staying = SCATTER_SECONDS + SCATTER_STAGGER * sign_unit((unsigned)index);
+    }
+    /* A hawk is over in a moment and a long way off, and the places it passes are
+     * back in a moment too: a hawk that left the sign in pieces for as long as the
+     * pointer does left it in pieces for most of a minute with two hawks up. */
+    if (staying == 0 && a_hawk_is_over(formation.x[target], formation.y[target]))
+        staying = HAWK_SCATTER_SECONDS + HAWK_SCATTER_STAGGER * sign_unit((unsigned)index);
+    return staying > left ? staying : left;
+}
+
+/*
+ * Text as the flock.
+ *
+ * Every letter is a bird whose home is its cell. What is about text, who is where
+ * and when each one leaves, lives in letters.c; what is here is what is about
+ * flying. A letter at home is perched and the birds neither see it nor move it. A
+ * letter that has left is a bird like the rest, flocking by the same rules, and
+ * the one thing it adds is that it can be called home: it then steers at its cell
+ * and lands on it exactly, as the intro's formation does, with a guarantee on top.
+ */
+enum { MAX_LETTERS = 16384, LETTERS_PACE_NOTCH = 0 };
+/* The pointer scatters what it is on: five cells across and three down, or so. A
+ * letter it has scattered comes down when its home is a third of a screen's
+ * thickness clear of it, wider than the touch so that it does not land to be
+ * scattered again. Hawks are bigger. */
+static const double POINTER_TOUCH_X = 20.0, POINTER_TOUCH_Y = 26.0, POINTER_CLEAR = 64.0;
+static const double HAWK_TOUCH = 44.0, HAWK_CLEAR = 100.0;
+/* A letter leaves with a hop, not at full speed: it climbs for this long, from a
+ * fifth of its pace, so that a wave is seen to lift the text before it flies. */
+static const double LETTER_LIFT_SECONDS = 0.4, LETTER_LIFT_FLOOR = 0.2;
+/* Banking is for flocking. A letter coming home turns freely once it is within this
+ * many turning circles of its cell, since to bank there is to orbit. */
+static const double LETTER_FREE_TURNS = 3.0;
+
+static void read_letter_pose(const void *context, int index, letters_pose_t *pose) {
+    const bird_t *birds = context;
+    pose->x = birds[index].x;
+    pose->y = birds[index].y;
+    pose->shade = birds[index].shade;
+}
+
+static void place_the_letters(bird_t *birds) {
+    for (int i = 0; i < config.birds; i++) {
+        birds[i] = (bird_t){0};
+        birds[i].x = the_letters.letter[i].home_x;
+        birds[i].y = the_letters.letter[i].home_y;
+        birds[i].perched = 1;
+    }
+}
+
+/* One frame of the cycle, before the flight: who is scattered, who leaves. The
+ * letters that left are put in the air at their homes, facing the way they go. The
+ * snapshot is told as well, because it was taken before this and the flight reads
+ * it. */
+static void tick_the_letters(bird_t *birds, bird_t *snapshot) {
+    letters_disturbance_t disturbances[1 + MAX_HAWKS];
+    int count = 0;
+    if (mouse.present)
+        disturbances[count++] = (letters_disturbance_t){
+            mouse.x, mouse.y, POINTER_TOUCH_X, POINTER_TOUCH_Y, POINTER_CLEAR, POINTER_CLEAR};
+    for (int h = 0; h < config.hawks; h++)
+        disturbances[count++] = (letters_disturbance_t){hawks[h].x, hawks[h].y, HAWK_TOUCH,
+                                                        HAWK_TOUCH, HAWK_CLEAR, HAWK_CLEAR};
+    letters_advance(&the_letters, frame_seconds, disturbances, count);
+    for (int k = 0; k < the_letters.launched_count; k++) {
+        int i = the_letters.launched[k];
+        const letter_t *letter = &the_letters.letter[i];
+        birds[i].x = letter->home_x;
+        birds[i].y = letter->home_y;
+        birds[i].direction = letter->launch_direction;
+        birds[i].frame = direction_frame(birds[i].direction);
+        birds[i].perched = 0;
+        snapshot[i] = birds[i];
+    }
+}
+
+/* How much of its pace a letter has in the first moments in the air. */
+static double letter_lift(int index) {
+    double t = the_letters.letter[index].airborne / LETTER_LIFT_SECONDS;
+    if (t >= 1) return 1;
+    return LETTER_LIFT_FLOOR + (1 - LETTER_LIFT_FLOOR) * t * t * (3 - 2 * t);
+}
+
+/* A letter that has been called home steers at its cell and goes no further than
+ * it: the last step is the distance left, and it is put on its home exactly, which
+ * is what makes the text whole again. Up to a couple of seconds after the call it
+ * banks like a bird, except near home where banking would only make it orbit; after
+ * that nothing holds it back, and the pace rises with the time left so that the last
+ * of them are in by the deadline whatever they were doing. Returns whether it was
+ * one of these. */
+static int steer_a_letter_home(bird_t *birds, const bird_t *snapshot, int i) {
+    letter_t *letter = &the_letters.letter[i];
+    if (letter->state != LETTER_HOMING) return 0;
+    double dx = letter->home_x - snapshot[i].x, dy = letter->home_y - snapshot[i].y;
+    double remaining = sqrt(dx * dx + dy * dy);
+    double step = config.speed;
+    int relaxed = letter->homing_for >= LETTERS_HOMING_RELAX;
+    if (relaxed) {
+        double left = LETTERS_HOMING_DEADLINE - letter->homing_for;
+        double needed = left > frame_seconds ? remaining * frame_seconds / left : remaining;
+        if (needed > step) step = needed;
+    }
+    if (remaining <= step) {
+        birds[i].x = letter->home_x;
+        birds[i].y = letter->home_y;
+        birds[i].perched = 1;
+        letters_land(&the_letters, i);
+        return 1;
+    }
+    double heading = normalized_angle(dy, dx);
+    double limit = turn_limit();
+    double turning_circle = limit > 1e-9 ? step / limit : 1e9;
+    if (!relaxed && remaining > LETTER_FREE_TURNS * turning_circle + step)
+        heading = turn_towards(snapshot[i].direction, heading, limit);
+    birds[i].direction = heading;
+    birds[i].x = snapshot[i].x + step * cos(heading);
+    birds[i].y = snapshot[i].y + step * sin(heading);
+    birds[i].shade = shade_for(&birds[i]);
+    return 1;
+}
+
+/*
+ * The flock in three dimensions.
+ *
+ * The flight itself is sky3d.c's: birds in a space, around a roost. What is here
+ * is the seam to everything that draws. Once a frame the camera takes its place on
+ * its orbit, every bird is projected, and what comes out is written into the same
+ * bird_t the flat flock is drawn from: the pixel its sprite's corner goes to, the
+ * way it points on the screen, and its bin, which is a size and a tint. Past that
+ * point the renderers, the recorder and the snapshot do not know the difference.
+ */
+static struct {
+    sky_t world;
+    sky_view_t *views;
+    int views_capacity;
+    int flying;
+    int shaped; /* The birds whose shape the last flying frame chose. */
+} sky;
+
+/* The flight is tuned in metres and seconds, and at the pace the program ships at
+ * a second of the show should be a second of it: the speed slider is the factor
+ * on that. */
+static const double SKY_TIME = 1.0 / DEFAULT_PACE;
+/* No step longer than this, in seconds of flight: a bird turns at a limited rate
+ * per step, and a long one is a bird that cannot turn where it was going to. */
+static const double SKY_LONGEST_STEP = 1.0 / 30;
+/* A live frame stands for the time since the one before, and a space flies it in
+ * as many steps as that takes. After a stall, a terminal that stopped reading, a
+ * stopped process, a laptop that slept (which CLOCK_MONOTONIC counts on macOS),
+ * one frame stood for all of it and flew it at once with the keys unread: a
+ * minute away was seconds of a frozen screen, and a machine that could not keep
+ * up fell further behind every frame. A live frame of a space stands for a quarter
+ * of a second at most, and what it misses it does not fly. A recording's frames
+ * are its own, and the flat sky flies a frame in three steps at most however long
+ * it is; both are left as they were. */
+static const double SKY_LONGEST_LIVE_FRAME = 0.25;
+
+static double live_frame_seconds(double elapsed) {
+    return sky_mode && elapsed > SKY_LONGEST_LIVE_FRAME ? SKY_LONGEST_LIVE_FRAME : elapsed;
+}
+enum { SKY_WARMUP_STEPS = 8 * 30 };
+/* How far from the line the pointer makes through the sky a bird feels it, in
+ * metres: a stick wider than a bird and narrower than the flock. */
+static const double SKY_POKE_REACH = 5.0;
+
+/* The sliders, as the weights the flight reads. Each is a factor on what the
+ * flight was tuned at, which is the factor its notch is on the default, so every
+ * slider means to the space what it means to the plane: more or less of the same. */
+static sky_rules_t sky_rules(void) {
+    sky_rules_t rules = sky_default_rules();
+    rules.separation *= config.separation / DEFAULT_SEPARATION_W;
+    rules.alignment *= config.alignment / DEFAULT_ALIGNMENT_W;
+    rules.roost *= config.boundary / DEFAULT_BOUNDARY_W;
+    rules.turn_rate = turning_notch_radians();
+    /* Perception is how far a bird sees in the plane. Here it is how many birds it
+     * heeds, one more a notch, and seven, the number starlings were measured
+     * heeding, at the default. */
+    rules.neighbours = 1 + config.vision_notch;
+    return rules;
+}
+
+static void sky_camera(sky_camera_t *camera) {
+    sky_camera_orbit(camera, sky.world.clock, screen.width, screen.height);
+    sky_camera_frame(camera, &sky.world);
+}
+
+/* Which of its shapes a bird is drawn as: how much of its length the camera sees,
+ * and how much of its span, which its wing beat takes a part of as well. */
+static int sky_shape(const sky_view_t *view, double beat) {
+    double span = view->across * beat;
+    int across = span >= 0.78 ? 0 : span >= 0.48 ? 1 : 2;
+    int along = view->along >= 0.6 ? 0 : 1;
+    return along * SKY_ACROSS_LEVELS + across;
+}
+
+/* Where the birds are on the screen, as the renderers want them. A frame that
+ * flies beats their wings as well; a paused one only looks, and leaves each bird
+ * the shape it was drawn in, choosing one only for a bird that has none yet. */
+static void project_the_sky(bird_t *birds, int beating) {
+    sky_camera_t camera;
+    sky_camera(&camera);
+    if (sky.views_capacity < config.birds) {
+        sky_view_t *views = realloc(sky.views, sizeof(*views) * (size_t)config.birds);
+        if (views == NULL) return;
+        sky.views = views;
+        sky.views_capacity = config.birds;
+    }
+    sky_view(&sky.world, config.birds, &camera, sky.views);
+    for (int i = 0; i < config.birds; i++) {
+        const sky_view_t *view = &sky.views[i];
+        bird_t *bird = &birds[i];
+        if (!view->visible) {
+            bird->x = bird->y = -1e6; /* Nowhere on any screen. */
+            continue;
+        }
+        double half = sky_bin_size(view->bin) / 2.0;
+        bird->x = view->x - half;
+        bird->y = view->y - half;
+        bird->layer = view->bin;
+        bird->direction = view->angle;
+        bird->frame = direction_frame(view->angle);
+        if (beating || i >= sky.shaped)
+            bird->shape = sky_shape(view, WING_SPAN[WING_SEQUENCE[bird->wing % WING_CYCLE]]);
+        if (beating) beat_wings(bird);
+    }
+    if (beating) sky.shaped = config.birds;
+    for (int i = 0; i < config.hawks && i < sky.world.hawk_count; i++) {
+        sky_view_t view;
+        hawk_t *hawk = &hawks[i];
+        sky_hawk_view(&sky.world, i, &camera, &view);
+        if (!view.visible) {
+            hawk->x = hawk->y = -1e6;
+            continue;
+        }
+        hawk->x = view.x;
+        hawk->y = view.y;
+        hawk->layer = view.bin;
+        hawk->direction = view.angle;
+        hawk->frame = direction_frame(view.angle);
+        /* It soars, wings out, until the dive, and then it beats. */
+        if (!beating) continue;
+        if (sky.world.hawks[i].diving) {
+            hawk->wing_clock += WING_HZ * WING_CYCLE * frame_seconds;
+            while (hawk->wing_clock >= 1.0) {
+                hawk->wing_clock -= 1.0;
+                hawk->wing = (hawk->wing + 1) % WING_CYCLE;
+            }
+        } else {
+            hawk->wing = 0;
+        }
+    }
+}
+
+static void begin_the_sky(bird_t *birds) {
+    sky_destroy(&sky.world);
+    /* The only draw from the flock's own numbers, so a seed is still a flock. */
+    uint32_t seed = next_random();
+    if (sky_init(&sky.world, config.birds, seed) != SKY_OK)
+        leave_saying("%s: out of memory for %d birds in a space\n", program_name, config.birds);
+    sky_populate(&sky.world, 0, config.birds, 0);
+    sky.flying = 1;
+    /* Let it settle before anybody looks: a flock thrown into the air as a cloud
+     * takes a few seconds to become one. */
+    sky_rules_t rules = sky_rules();
+    for (int step = 0; step < SKY_WARMUP_STEPS; step++)
+        sky_step(&sky.world, config.birds, &rules, NULL, SKY_LONGEST_STEP);
+    sky.world.clock = 0;
+    sky_set_hawks(&sky.world, config.hawks);
+    for (int i = 0; i < config.birds; i++) {
+        birds[i] = (bird_t){0};
+        birds[i].wing = (int)(random_unit() * WING_CYCLE) % WING_CYCLE;
+        birds[i].wing_clock = random_unit();
+    }
+    project_the_sky(birds, 1);
+}
+
+static int grow_the_sky(int from, int to) {
+    if (!sky.flying) return 1;
+    if (sky_reserve(&sky.world, to) != SKY_OK) return 0;
+    if (to > from) sky_populate(&sky.world, from, to - from, 1);
+    return 1;
+}
+
+static void end_the_sky(void) {
+    sky_destroy(&sky.world);
+    free(sky.views);
+    memset(&sky, 0, sizeof(sky));
+}
+
+static void fly_the_sky(bird_t *birds) {
+    sky_rules_t rules = sky_rules();
+    sky_poke_t poke = {0};
+    if (mouse.present) {
+        sky_camera_t camera;
+        sky_camera(&camera);
+        poke.active = 1;
+        poke.reach = SKY_POKE_REACH;
+        sky_camera_ray(&camera, mouse.x, mouse.y, poke.origin, poke.direction);
+    }
+    sky_set_hawks(&sky.world, config.hawks);
+    double seconds = flight_seconds() * SKY_TIME;
+    int steps = (int)ceil(seconds / SKY_LONGEST_STEP - 1e-9);
+    if (steps < 1) steps = 1;
+    for (int step = 0; step < steps; step++)
+        sky_step(&sky.world, config.birds, &rules, &poke, seconds / steps);
+    project_the_sky(birds, 1);
+}
+
+/* Paused, a space is still seen from where the camera stands: the birds that + has
+ * added, a hawk that k has called and a window of another size are put where they
+ * are, where they would otherwise be drawn wherever the flat sky put them until the
+ * flight went on. Nothing flies, beats its wings or draws a random number. */
+static void look_at_the_sky(bird_t *birds) {
+    if (sky.shaped > config.birds) sky.shaped = config.birds;
+    sky_set_hawks(&sky.world, config.hawks);
+    project_the_sky(birds, 0);
+}
+
+static void update_birds(bird_t *birds, const bird_t *snapshot, const spatial_grid_t *grid) {
+    measure_flocks(snapshot);
+    for (int i = 0; i < config.birds; i++) {
+        if (snapshot[i].perched) continue; /* A letter at home stays where it is. */
+        if (letters_mode && steer_a_letter_home(birds, snapshot, i)) continue;
+        double direction = flock_direction(snapshot, grid, i);
+        /* Banking is for flocking. Two things are not flocking and are exempt: a
+         * bird writing a letter, which has to be able to land on it, and a bird
+         * inside the panel's turn zone, whose push is a constraint rather than a
+         * force. Limiting that one would break the panel's unreachability, which
+         * is proved on the assumption that a bird can turn away at once. */
+        double want_x, want_y;
+        int writing = formation_target_for(&snapshot[i], i, &want_x, &want_y);
+        if (!writing && !legend_turn_zone(snapshot[i].x, snapshot[i].y))
+            direction = turn_towards(snapshot[i].direction, direction, turn_limit());
+        birds[i].direction = direction;
+        /* Never past the target: the last step is the distance left, which is
+         * what makes a letter crisp instead of a cloud orbiting one. */
+        double step = config.speed * flock_pace(snapshot[i].flock);
+        if (snapshot[i].layer > 0) step *= FAR_PACE; /* Further away moves slower: parallax. */
+        if (letters_mode) step *= letter_lift(i);
+        if (writing) {
+            double dx = want_x - birds[i].x, dy = want_y - birds[i].y;
+            double remaining = sqrt(dx * dx + dy * dy);
+            if (remaining < step) step = remaining;
+        }
+        birds[i].x += step * cos(direction);
+        birds[i].y += step * sin(direction);
+        if (the_rain_is_falling) wrap_position(&birds[i]);
+        if (formation.sign) birds[i].scattered = sign_scatter_left(&snapshot[i], i);
+        birds[i].shade = shade_for(&birds[i]);
+        /* A writer of a sign is the colour of its place, and keeps it from the
+         * moment it is sent: its heading goes round the loop of its hover once or
+         * twice a second, and a colour that went round the ramp with it would make
+         * the letters flicker. */
+        if (the_sign.kind == SIGN_PICTURE)
+            birds[i].shade = picture_shade[i]; /* The picture's colour, flying or home. */
+        else if (writing && formation.sign && config.flocks == 1 && palette_shades() > 1)
+            birds[i].shade = sign_shade_for(i);
+        if (!letters_mode) beat_wings(&birds[i]); /* Letters do not have wings. */
+        if (config.trails && i % TRAIL_EVERY == 0) {
+            /* Where it was, not where it is: a tail behind, never under. */
+            birds[i].trail_x[birds[i].trail_at] = snapshot[i].x;
+            birds[i].trail_y[birds[i].trail_at] = snapshot[i].y;
+            birds[i].trail_at = (birds[i].trail_at + 1) % TRAIL_LENGTH;
+            if (birds[i].trail_held < TRAIL_LENGTH) birds[i].trail_held++;
+        }
+    }
+}
+
+static int bird_placement(const bird_t *bird, kitty_graphics_placement_t *placement) {
+    if (bird->x < 0 || bird->y < 0) return 0;
+
+    /* The flat flock is kept out of the panel by a force. A space is projected
+     * wherever it lands, so what falls behind the panel is not drawn. */
+    if (sky_mode && bird->x < screen.legend_width && bird->y < screen.legend_height) return 0;
+
+    int pixel_x = (int)bird->x;
+    int pixel_y = (int)bird->y;
+    int column = pixel_x / screen.cell_width;
+    int row = pixel_y / screen.cell_height;
+    if (column >= screen.cols || row >= screen.rows) return 0;
+
+    /* The far layer underneath; in a space each size over the one before it. */
+    int z_index = bird->layer > 0 ? -1 : 0;
+    if (sky_mode) z_index = bird->layer;
+    *placement = (kitty_graphics_placement_t){
+        .image_id = sprite_image_id(bird),
+        .placement_id = 0,
+        .row = row,
+        .column = column,
+        .x_offset = pixel_x % screen.cell_width,
+        .y_offset = pixel_y % screen.cell_height,
+        .z_index = z_index,
+    };
+    return 1;
+}
+
+static int frame_limit;
+static int bench_frames;
+static const char *snapshot_path;
+static const char *record_path;
+static int record_fps = 25;
+/* Zero until asked for: six seconds for a flock, and for text the whole cycle of it
+ * (see settle_the_recording_length). */
+static int record_seconds;
+/* The size of the recording, in cells, as one thing: two flags for one idea, and
+ * nobody was ever going to reach for four hundred by a hundred and twenty. */
+static int record_columns = 96;
+static int record_rows = 26;
+static const char *requested_record_size;
+
+/* What the panel's stats row reports, averaged over the last second so the
+ * numbers are readable rather than flickering. */
+static struct {
+    double frame_ms;
+    double bytes;
+    double rate;
+    long counted;
+    double window_started;
+    double window_ms;
+    double window_bytes;
+} stats;
+
+/* One slider row: the name, the bar, and the two keys that move it, the lowering
+ * one first because that is the end of the bar it works from. The filled length
+ * is the notch itself, not a value scaled into cells, so a keypress moves the bar
+ * by exactly one cell and nothing rounds. No number: the bar is the readout. */
+static void legend_slider(char *line, size_t size, const char *name, int notch, const char *value,
+                          char lower, char raise) {
+    char bar[LEGEND_BAR_CELLS * 3 + 1];
+    size_t at = 0;
+
+    for (int cell = 0; cell < LEGEND_BAR_CELLS; cell++) {
+        const char *glyph = cell < notch ? "\u2593" : "\u2591";
+        memcpy(bar + at, glyph, 3);
+        at += 3;
+    }
+    bar[at] = '\0';
+    /* The value is right aligned in a column of its own, so the numbers line up
+     * under each other and the keys stay where the eye already looks for them.
+     * Padded by cells rather than by bytes: a degree sign is two bytes and one
+     * cell, and printf counts the bytes, so that row came out a cell short and
+     * the panel had a bite out of its right hand side. */
+    size_t bytes = strlen(value), glyphs = 0;
+    for (const unsigned char *c = (const unsigned char *)value; *c != '\0'; c++)
+        if ((*c & 0xc0) != 0x80) glyphs++;
+    int column = LEGEND_VALUE_WIDTH + (int)(bytes - glyphs);
+    snprintf(line, size, "\u2502 %-*s %s %*s  %c/%c \u2502", LEGEND_NAME_WIDTH, name, bar, column,
+             value, lower, raise);
+}
+
+/* Enough decimals to tell one notch from the next, and no more: separation and
+ * cohesion step in thousandths, the other two in hundredths. */
+static void legend_number(char *out, size_t size, double value, int decimals) {
+    snprintf(out, size, "%.*f", decimals, value);
+}
+
+/* The panel, ten rows of it, anchored to the top left corner. */
+static void build_legend(char lines[LEGEND_MAX_ROWS][LEGEND_LINE_MAX]) {
+    int rows = legend_rows();
+    int inner = LEGEND_COLUMNS - 2;
+    size_t at = 0;
+
+    memcpy(lines[0], "\u256d", 3);
+    at = 3;
+    for (int i = 0; i < inner; i++, at += 3) memcpy(lines[0] + at, "\u2500", 3);
+    memcpy(lines[0] + at, "\u256e", 4);
+
+    char value[LEGEND_VALUE_WIDTH + 8];
+    /* In three dimensions a row says what it does there, as a factor on the flock's
+     * own: the edges are a roost that pulls, and the numbers of the plane are not
+     * the space's. */
+    legend_number(value, sizeof(value), config.boundary, 2);
+    if (sky_mode)
+        snprintf(value, sizeof(value), "%.2f\u00d7", config.boundary / DEFAULT_BOUNDARY_W);
+    legend_slider(lines[1], LEGEND_LINE_MAX, sky_mode ? "roost" : "boundary", config.boundary_notch,
+                  value, 'b', 'B');
+    legend_number(value, sizeof(value), config.separation, 3);
+    if (sky_mode)
+        snprintf(value, sizeof(value), "%.2f\u00d7", config.separation / DEFAULT_SEPARATION_W);
+    legend_slider(lines[2], LEGEND_LINE_MAX, "separation", config.separation_notch, value, 's',
+                  'S');
+    legend_number(value, sizeof(value), config.alignment, 2);
+    if (sky_mode)
+        snprintf(value, sizeof(value), "%.2f\u00d7", config.alignment / DEFAULT_ALIGNMENT_W);
+    legend_slider(lines[3], LEGEND_LINE_MAX, "alignment", config.alignment_notch, value, 'a', 'A');
+    /* On the panel because it has keys: t and T used to change the banking with
+     * nothing on the screen to say what they had done, which is how somebody could
+     * turn it to nothing and be left looking at an empty sky. */
+    snprintf(value, sizeof(value), "%.0f\u00b0", turning_notch_radians() * 180 / M_PI);
+    legend_slider(lines[4], LEGEND_LINE_MAX, "turning", config.turning_notch, value, 't', 'T');
+    /* Pixels are whole numbers, so they print as such. */
+    snprintf(value, sizeof(value), "%dpx", config.vision_radius);
+    if (sky_mode) snprintf(value, sizeof(value), "%d", 1 + config.vision_notch);
+    legend_slider(lines[5], LEGEND_LINE_MAX, sky_mode ? "neighbours" : "perception",
+                  config.vision_notch, value, 'p', 'P');
+    /* A factor on the shipped pace, so 1.0 is the flock as it comes. Last, so the
+     * rows above keep the places they have always had. */
+    snprintf(value, sizeof(value), "%.1f\u00d7", config.pace);
+    legend_slider(lines[6], LEGEND_LINE_MAX, "speed", config.pace_notch, value, 'v', 'V');
+    /* Only with somebody to avoid: with one flock the row would be a slider that
+     * moves nothing. A quarter a notch, one on the fourth, like the speed. */
+    if (config.flocks > 1) {
+        snprintf(value, sizeof(value), "%.2f\u00d7", config.avoid_notch / 4.0);
+        legend_slider(lines[7], LEGEND_LINE_MAX, "avoidance", config.avoid_notch, value, 'g', 'G');
+    }
+
+    /* What the frame costs, always, rather than behind a flag: it was a switch
+     * that did nothing at all unless the panel was up, and the row it wrote into
+     * was otherwise blank. Built as text and padded to the same inner width as
+     * every other row — written straight into the row it came out four cells short
+     * and the panel had a notch in its right hand side. The units are on the
+     * numbers, because 2.1 30 60 is three numbers and not a sentence. */
+    char measured[LEGEND_LINE_MAX / 2];
+    snprintf(measured, sizeof(measured), "%-*s %5.1fms %5.0fKB %3.0ffps", LEGEND_NAME_WIDTH,
+             "frame", stats.frame_ms, stats.bytes / 1024.0, stats.rate);
+    snprintf(lines[rows - 3], LEGEND_LINE_MAX, "\u2502 %-*s \u2502", inner - 2, measured);
+    snprintf(lines[rows - 2], LEGEND_LINE_MAX, "\u2502 %-*s q%*s \u2502", LEGEND_NAME_WIDTH, "quit",
+             inner - LEGEND_NAME_WIDTH - 4, "");
+
+    memcpy(lines[rows - 1], "\u2570", 3);
+    at = 3;
+    for (int i = 0; i < inner; i++, at += 3) memcpy(lines[rows - 1] + at, "\u2500", 3);
+    memcpy(lines[rows - 1] + at, "\u256f", 4);
+}
+
+static kitty_graphics_status_t queue_legend(kitty_graphics_t *graphics) {
+    char lines[LEGEND_MAX_ROWS][LEGEND_LINE_MAX];
+
+    if (screen.legend_width == 0) {
+        /* Switched off by a viewport that shrank under it. The panel never moves
+         * and never changes size, so these are the only rows that can ever hold
+         * stale text, and they are erased one line at a time: an erase of the
+         * whole screen would delete the uploaded sprites and leave every later
+         * placement pointing at nothing. */
+        if (!legend_drawn) return KITTY_GRAPHICS_OK;
+        for (int row = 0; row < legend_rows(); row++) {
+            kitty_graphics_status_t status = kitty_graphics_write_text(graphics, row, 0, "\033[K");
+            if (status != KITTY_GRAPHICS_OK) return status;
+        }
+        legend_drawn = 0;
+        return KITTY_GRAPHICS_OK;
+    }
+
+    build_legend(lines);
+    for (int row = 0; row < legend_rows(); row++) {
+        kitty_graphics_status_t status = kitty_graphics_write_text(graphics, row, 0, lines[row]);
+        if (status != KITTY_GRAPHICS_OK) return status;
+    }
+    legend_drawn = 1;
+    return KITTY_GRAPHICS_OK;
+}
+
+static kitty_graphics_status_t queue_text_frame(kitty_graphics_t *graphics, const bird_t *birds);
+
+static kitty_graphics_status_t queue_render_frame(kitty_graphics_t *graphics, const bird_t *birds) {
+    if (drawing_with_text()) return queue_text_frame(graphics, birds);
+    kitty_graphics_status_t status = kitty_graphics_begin_synchronized_update(graphics);
+    if (status == KITTY_GRAPHICS_OK) status = kitty_graphics_delete_all_placements(graphics);
+    /* Far birds first and underneath, then the tails, the near birds, the hawks. */
+    for (int pass = 0; pass < layer_count() && status == KITTY_GRAPHICS_OK; pass++) {
+        int layer = layer_in_pass(pass);
+        if (layer == 0 && config.trails && !sky_mode) {
+            for (int i = 0; status == KITTY_GRAPHICS_OK && i < config.birds; i += TRAIL_EVERY) {
+                if (birds[i].layer != 0) continue;
+                for (int step = 0; step < birds[i].trail_held && status == KITTY_GRAPHICS_OK;
+                     step++) {
+                    /* The newest ghost is the strongest: steps count back from the
+                     * write position, oldest first in the ring. */
+                    int age = (birds[i].trail_at - 1 - step + TRAIL_LENGTH) % TRAIL_LENGTH;
+                    bird_t ghost = birds[i];
+                    ghost.x = birds[i].trail_x[age];
+                    ghost.y = birds[i].trail_y[age];
+                    kitty_graphics_placement_t placement;
+                    if (bird_placement(&ghost, &placement)) {
+                        placement.image_id = set_image_id(trail_set(step), ghost.frame);
+                        status = kitty_graphics_place(graphics, &placement);
+                    }
+                }
+            }
+        }
+        for (int i = 0; status == KITTY_GRAPHICS_OK && i < config.birds; i++) {
+            if (birds[i].layer != layer) continue;
+            kitty_graphics_placement_t placement;
+            if (bird_placement(&birds[i], &placement))
+                status = kitty_graphics_place(graphics, &placement);
+        }
+    }
+    for (int i = 0; status == KITTY_GRAPHICS_OK && i < config.hawks; i++) {
+        /* Over every bird, in a space too: it is what the picture is of. In the flat
+         * sky that is the near plane, where a layer above it would be the far one. */
+        bird_t as_bird = {.x = hawks[i].x - hawk_offset_of(&hawks[i]),
+                          .y = hawks[i].y - hawk_offset_of(&hawks[i]),
+                          .frame = hawks[i].frame,
+                          .layer = sky_mode ? SKY_BINS : 0};
+        kitty_graphics_placement_t placement;
+        if (bird_placement(&as_bird, &placement)) {
+            placement.image_id = hawk_image_id(&hawks[i]);
+            status = kitty_graphics_place(graphics, &placement);
+        }
+    }
+    if (status == KITTY_GRAPHICS_OK) status = queue_legend(graphics);
+    if (status == KITTY_GRAPHICS_OK) status = kitty_graphics_end_synchronized_update(graphics);
+    return status;
+}
+
+/*
+ * The text renderer's own state: the sprites as pixels, a canvas the size of
+ * the screen, and the grid of cells that is diffed against the last frame.
+ */
+static png_status_t rasterise_sprites(png_image_t *frames);
+static void compose_onto(png_image_t *canvas, const png_image_t *frames, const bird_t *birds,
+                         int with_ground);
+
+static png_image_t text_sprites[ROTATION_FRAMES * MAX_SPRITE_SETS];
+static png_image_t text_canvas;
+static cells_t text_cells;
+static int text_legend_was_drawn;
+
+/* Whether the terminal can take a 24 bit colour. COLORTERM is the convention,
+ * and nearly every terminal that can sets it; one that cannot gets the nearest
+ * of the 256 colour cube, which is coarser and still a flock. */
+static int terminal_has_truecolor(void) {
+    const char *colorterm = getenv("COLORTERM");
+    if (colorterm == NULL) return 0;
+    return strcmp(colorterm, "truecolor") == 0 || strcmp(colorterm, "24bit") == 0;
+}
+
+static int prepare_text_renderer(void) {
+    /* Letters are drawn as themselves: there is nothing to rasterise. */
+    if (!letters_mode && rasterise_sprites(text_sprites) != PNG_OK) return 0;
+    /* Whatever an earlier run left in them is let go of first: cells_init starts
+     * from nothing and would lose it. */
+    cells_destroy(&text_cells);
+    if (cells_init(&text_cells, terminal_has_truecolor()) != CELLS_OK) return 0;
+    return 1;
+}
+
+/* The ground a composed picture is painted on: a recording's frames, a snapshot
+ * under a text renderer, and the colour a far bird's tint is pulled towards. The
+ * live screen is never painted, so this is the one place a background exists. */
+static const uint8_t PICTURE_GROUND[3] = {18, 18, 24};
+/* A cell of a picture of text: the 5 by 7 font at twice its size with a pixel of air
+ * a side, which is as small as it reads in a GIF on a page. */
+enum { LETTER_PICTURE_WIDTH = 12, LETTER_PICTURE_HEIGHT = 20 };
+
+/* The ground a picture is painted on, and the sky a far bird fades into. A dark
+ * one, unless ink has asked the terminal and been told otherwise: a bird as dark
+ * as ink pulled towards a dark ground gets darker, and on a white terminal that
+ * is the wrong way. */
+static const uint8_t *picture_ground(void) {
+    return the_ground_is_known() ? ink_ground : PICTURE_GROUND;
+}
+
+/* Sized to the screen, and resized with it. */
+static int text_renderer_fits_the_screen(void) {
+    if (!letters_mode &&
+        (text_canvas.width != screen.width || text_canvas.height != screen.height)) {
+        png_image_free(&text_canvas);
+        if (png_image_alloc(&text_canvas, screen.width, screen.height) != PNG_OK) return 0;
+    }
+    return cells_resize(&text_cells, screen.cols, screen.rows) == CELLS_OK;
+}
+
+/* A hawk over text is an arrow in the hawk's colour, pointing the way it flies:
+ * east, then clockwise round the compass on a screen whose y runs down. */
+static const uint32_t HAWK_ARROWS[8] = {0x2192, 0x2198, 0x2193, 0x2199,
+                                        0x2190, 0x2196, 0x2191, 0x2197};
+
+/* The text as it is this frame: the letters at home as printed, the ones in the air
+ * where they are, in the flock's colours if they have none of their own, and the
+ * hawks on top. */
+static void paint_the_letters(const bird_t *birds) {
+    letters_look_t look = {NULL, 0};
+    if (sprite_path == NULL && palette()->tints != NULL) {
+        look.ramp = palette()->tints;
+        look.ramp_shades = palette()->shades;
+    }
+    letters_paint(&the_letters, &text_cells, read_letter_pose, birds, &look);
+    for (int h = 0; h < config.hawks; h++) {
+        int col = (int)floor(hawks[h].x / screen.cell_width);
+        int row = (int)floor(hawks[h].y / screen.cell_height);
+        cell_t *cell = cells_at(&text_cells, col, row);
+        if (cell == NULL || cell->wide != CELLS_NARROW) continue;
+        cell->glyph = HAWK_ARROWS[(int)floor(hawks[h].direction / (M_PI / 4) + 0.5) & 7];
+        memcpy(cell->fg, hawk_colour(), 3);
+        cell->fg_kind = CELLS_COLOUR_RGB;
+        cell->has_fg = 1;
+        cell->attributes = CELLS_BOLD;
+    }
+}
+
+/* A hawk in a space is a few pixels among two thousand birds, and a text cell wears
+ * the colour most of its ink is in: inside the flock the birds outvoted it, and for
+ * a second or more of a hunt the hawk was not drawn at all. Once the cells are read,
+ * every cell its own picture has ink in wears its colour, as a hawk over text is an
+ * arrow in it; the dots are still the ones the canvas has. The flat sky's hawk is
+ * twice a bird and has cleared the air round it, and is left as it was. */
+static void colour_the_hawks_in(cells_t *cells, const png_image_t *frames) {
+    if (!sky_mode) return;
+    const uint8_t *colour = hawk_colour();
+    for (int h = 0; h < config.hawks; h++) {
+        const png_image_t *sprite = &frames[hawk_set(hawk_wing(&hawks[h])) * ROTATION_FRAMES +
+                                            hawks[h].frame % ROTATION_FRAMES];
+        if (sprite->pixels == NULL) continue;
+        int left = (int)hawks[h].x - hawk_offset_of(&hawks[h]);
+        int top = (int)hawks[h].y - hawk_offset_of(&hawks[h]);
+        for (int y = 0; y < sprite->height; y++)
+            for (int x = 0; x < sprite->width; x++) {
+                if (sprite->pixels[((size_t)y * (size_t)sprite->width + (size_t)x) * 4 + 3] < 128)
+                    continue;
+                if (left + x < 0 || top + y < 0) continue;
+                cell_t *cell =
+                    cells_at(cells, (left + x) / screen.cell_width, (top + y) / screen.cell_height);
+                if (cell == NULL || cell->glyph == 0) continue;
+                if (cell->has_fg) memcpy(cell->fg, colour, 3);
+                if (cell->has_bg) memcpy(cell->bg, colour, 3);
+            }
+    }
+}
+
+static kitty_graphics_status_t queue_text_frame(kitty_graphics_t *graphics, const bird_t *birds) {
+    if (!text_renderer_fits_the_screen()) return KITTY_GRAPHICS_ERR_MEMORY;
+    kitty_graphics_status_t status = kitty_graphics_begin_synchronized_update(graphics);
+    /* The panel first, so that when it is switched off the rows it erases are
+     * redrawn by the cells that follow in the same frame, and when it is on the
+     * cells leave its corner alone rather than drawing over its text. */
+    if (status == KITTY_GRAPHICS_OK) status = queue_legend(graphics);
+    if (legend_drawn != text_legend_was_drawn) {
+        cells_invalidate(&text_cells);
+        text_legend_was_drawn = legend_drawn;
+    }
+    cells_keep_out_of(&text_cells, legend_drawn ? LEGEND_COLUMNS : 0,
+                      legend_drawn ? legend_rows() : 0);
+
+    if (letters_mode) {
+        paint_the_letters(birds);
+    } else {
+        compose_onto(&text_canvas, text_sprites, birds, 0);
+        cells_read(&text_cells, text_style(), &text_canvas, screen.cell_width, screen.cell_height);
+        colour_the_hawks_in(&text_cells, text_sprites);
+    }
+    if (cells_emit(&text_cells) != CELLS_OK) return KITTY_GRAPHICS_ERR_MEMORY;
+    if (status == KITTY_GRAPHICS_OK)
+        status = kitty_graphics_write_raw(graphics, text_cells.text, text_cells.length);
+    if (status == KITTY_GRAPHICS_OK) status = kitty_graphics_end_synchronized_update(graphics);
+    return status;
+}
+
+static void set_frame_seconds(double seconds);
+
+/*
+ * One frame of flight, for the hawks and the flock, from the snapshot and grid the
+ * caller has just built of the birds.
+ *
+ * Above pace one the frame is flown in as many equal steps as the pace needs to
+ * keep each no longer than a step at pace one. Flown in a single step, a bird at
+ * two and a half times the pace crossed a small terminal's edge band in a frame,
+ * decided once where the flock was, and one bird in ten was off the screen at any
+ * moment against one in forty at pace one. Each step is the same decision the
+ * flock always made, so the flock flies faster and not worse; the price is the
+ * simulation run that many times, which --bench shows.
+ */
+static void fly(bird_t *birds, bird_t *snapshot, spatial_grid_t *grid) {
+    if (sky_mode) {
+        fly_the_sky(birds);
+        return;
+    }
+    if (letters_mode) tick_the_letters(birds, snapshot);
+    int steps = (int)ceil(config.pace - 1e-9);
+    if (steps < 1) steps = 1;
+    double whole = frame_seconds;
+    if (steps > 1) set_frame_seconds(whole / steps);
+    for (int step = 0; step < steps; step++) {
+        if (step > 0) {
+            memcpy(snapshot, birds, sizeof(*birds) * (size_t)config.birds);
+            /* Prepared for this many birds by the caller, so it cannot fail here. */
+            spatial_grid_build(grid, config.birds, read_bird_position, snapshot);
+        }
+        hunt(snapshot);
+        update_birds(birds, snapshot, grid);
+    }
+    if (steps > 1) set_frame_seconds(whole);
+    for (int i = 0; i < config.birds; i++) birds[i].frame = direction_frame(birds[i].direction);
+}
+
+/* The way out after q: straight up, every one of them, and nothing else steering.
+ * At the shipped pace whatever the slider says, so that leaving takes the same
+ * moment every time: at a fifth of the pace the flock was still on the screen
+ * when the program closed it. */
+/* The same for letters, which are mostly at home when it comes: each goes up at a
+ * speed of its own after a short wait of its own, so that the text does not rise
+ * as one sheet. The wait is kept in the field a letter never uses for gliding, and
+ * the speed in the one it never uses for its wings. */
+static void fly_the_letters_away(bird_t *birds) {
+    for (int i = 0; i < config.birds; i++) {
+        if (birds[i].perched) {
+            birds[i].perched = 0;
+            letters_release(&the_letters, i);
+            birds[i].gliding = 0.15 * random_unit();
+            birds[i].wing_clock = 0.6 + 0.8 * random_unit();
+        }
+        birds[i].direction = 3 * M_PI / 2;
+        if (birds[i].gliding > 0) {
+            birds[i].gliding -= frame_seconds;
+            continue;
+        }
+        birds[i].y -= config.base_speed * birds[i].wing_clock;
+        birds[i].frame = direction_frame(birds[i].direction);
+    }
+}
+
+static void fly_away(bird_t *birds) {
+    if (letters_mode) {
+        fly_the_letters_away(birds);
+        return;
+    }
+    for (int i = 0; i < config.birds; i++) {
+        birds[i].direction = 3 * M_PI / 2;
+        birds[i].y -= config.base_speed;
+        birds[i].frame = direction_frame(birds[i].direction);
+    }
+}
+
+/*
+ * The post.
+ *
+ * Everything that crosses between windows is a traveller: where it left, as a
+ * share of the height, so that windows of any size line up; how far past the edge
+ * its middle had gone, so that a bird going fast lands as far in as it would have
+ * gone; and the rest as it was. It is handed over when its middle crosses the
+ * edge, a bird being drawn from its corner: at that moment the half of the sprite
+ * the window loses is the half the next one gains, and a bird crossing two windows
+ * side by side is never wholly in neither.
+ */
+/* A bird that has been flying out of a door nobody would open for a few seconds is
+ * a long way out, and a datagram with a distance the format does not believe is
+ * one that is thrown away: the way in is never further than a window. */
+static double post_reach(double reach) {
+    return reach < screen.width ? reach : screen.width;
+}
+
+/* Where a thing is, as a share of the window, kept inside it. */
+static double share_of(double position, double length) {
+    double share = length > 0 ? position / length : 0;
+    return share < 0 ? 0 : share > 1 ? 1 : share;
+}
+
+static link_traveller_t traveller_of_bird(const bird_t *bird, double reach) {
+    link_traveller_t traveller = {
+        .kind = LINK_BIRD,
+        .height = share_of(bird->y, screen.height),
+        .reach = post_reach(reach),
+        .direction = bird->direction,
+        .flock = bird->flock,
+        .shade = bird->shade,
+        .layer = bird->layer,
+        .wing = bird->wing,
+        .wing_clock = bird->wing_clock,
+        .holding = bird->gliding,
+    };
+    return traveller;
+}
+
+static link_traveller_t traveller_of_hawk(const hawk_t *hawk, double reach) {
+    link_traveller_t traveller = {
+        .kind = LINK_HAWK,
+        .height = share_of(hawk->y, screen.height),
+        .reach = post_reach(reach),
+        .direction = hawk->direction,
+        .wing = hawk->wing,
+        .wing_clock = hawk->wing_clock,
+        .holding = hawk->passing,
+    };
+    return traveller;
+}
+
+/* The numbers came from another window, which may be a different size, with other
+ * flocks and another palette, so each is made to mean something here. */
+static double landing_reach(const link_traveller_t *traveller) {
+    double most = screen.width / 4.0;
+    return traveller->reach < most ? traveller->reach : most;
+}
+
+static double landing_height(const link_traveller_t *traveller) {
+    double y = traveller->height * screen.height;
+    double last = screen.height - 1.0;
+    if (y > last) y = last;
+    return y < 0 ? 0 : y;
+}
+
+static void land_a_bird(bird_t *bird, const link_traveller_t *traveller) {
+    double half = config.bird_size / 2.0;
+    *bird = (bird_t){0};
+    bird->x = traveller->enters == LINK_LEFT ? landing_reach(traveller) - half
+                                             : screen.width - landing_reach(traveller) - half;
+    bird->y = landing_height(traveller);
+    /* Kitty places a sprite by its corner and does not place one that begins
+     * left of the window or does not fit it, so a bird half in at the edge would
+     * not be drawn for the frame or two it takes to be wholly in. It comes in
+     * wholly, which is at most half a sprite further than the middle said. The
+     * text renderers clip, and draw it as far in as it is. */
+    if (render_mode == RENDER_KITTY) {
+        double last = screen.width - (double)config.bird_size;
+        if (bird->x > last) bird->x = last;
+        if (bird->x < 0) bird->x = 0;
+    }
+    /* The panel is a rectangle no bird enters; one that would come in behind it
+     * comes in beneath it instead. */
+    if (legend_turn_zone(bird->x, bird->y)) bird->y = screen.legend_height + config.speed + 1;
+    bird->direction = traveller->direction < 2 * M_PI ? traveller->direction : 0;
+    bird->frame = direction_frame(bird->direction);
+    bird->flock = traveller->flock % config.flocks;
+    bird->layer = deep_look && traveller->layer > 0 ? 1 : 0;
+    bird->shade = traveller->shade % palette_shades();
+    bird->wing = traveller->wing % WING_CYCLE;
+    bird->wing_clock = traveller->wing_clock;
+    bird->gliding = traveller->holding;
+}
+
+static void land_a_hawk(hawk_t *hawk, const link_traveller_t *traveller) {
+    *hawk = (hawk_t){0};
+    hawk->x = traveller->enters == LINK_LEFT ? landing_reach(traveller)
+                                             : screen.width - landing_reach(traveller);
+    hawk->y = landing_height(traveller);
+    if (render_mode == RENDER_KITTY) { /* As the walls keep it, wholly on the screen. */
+        double margin = hawk_draw_offset(), last = screen.width - 1 - margin;
+        if (hawk->x > last) hawk->x = last;
+        if (hawk->x < margin) hawk->x = margin;
+    }
+    hawk->direction = traveller->direction < 2 * M_PI ? traveller->direction : 0;
+    hawk->frame = direction_frame(hawk->direction);
+    hawk->prey = -1; /* It looks for its own, among this sky's birds. */
+    hawk->passing = traveller->holding;
+    hawk->wing = traveller->wing % WING_CYCLE;
+    hawk->wing_clock = traveller->wing_clock;
+}
+
+/* What is kept for a bird by its place in the array and not in bird_t: the place
+ * it writes in a sign and how it loops there, and the colour a picture gives it. A
+ * bird that moves takes all of it along, and a bird that comes in has none: it
+ * writes nothing. Every array in the program that is indexed by a bird is here, and
+ * a new one belongs here too, or a bird swapped into a place would be the one that
+ * was there before. The temporary ones (the candidates of a sign) are built afresh
+ * every time they are used and keep nothing from one frame to the next. */
+static void move_what_is_kept_for_a_bird(int to, int from) {
+    formation.slot[to] = formation.slot[from];
+    formation.hover_x[to] = formation.hover_x[from];
+    formation.hover_y[to] = formation.hover_y[from];
+    picture_shade[to] = picture_shade[from];
+}
+
+static void forget_what_is_kept_for_a_bird(int index) {
+    formation.slot[index] = -1;
+    formation.hover_x[index] = formation.hover_y[index] = 0;
+    picture_shade[index] = 0;
+}
+
+/* A sign that is up is written by birds that stay where they write, and the birds
+ * that come and go are the free flock, so the sign is as laid out for the flock as
+ * it was and is not laid out again for every bird that crosses, which in a busy
+ * crossing would be every frame: the writers of a clock would all be picked anew
+ * and the minute would let go of the whole sign. A key that changes the flock does
+ * not pass this way, and still has the sign laid out again. */
+static void the_sign_follows_the_traffic(int birds) {
+    the_sign.key_birds += birds;
+}
+
+/* A bird leaves the flock and the last one fills the gap, which moves one bird
+ * and not all that come after it. Everything that remembers a bird by its place
+ * in the array is made good: a hawk after the bird that has gone loses it, and one
+ * after the bird that has moved follows it, and so does every other array that is
+ * indexed by a bird. The tail behind a bird goes with it, but only where the place
+ * it lands keeps tails (every fourth), and starts again where it was a place that
+ * did not: a ring from nowhere would draw ghosts of where the bird was never. */
+static void take_out_bird(bird_t *birds, int index) {
+    int last = config.birds - 1;
+    for (int h = 0; h < config.hawks; h++) {
+        if (hawks[h].prey == index) {
+            hawks[h].prey = -1;
+            hawks[h].commitment = 0;
+        } else if (hawks[h].prey == last) {
+            hawks[h].prey = index;
+        }
+    }
+    if (index != last) {
+        birds[index] = birds[last];
+        if (index % TRAIL_EVERY == 0 && last % TRAIL_EVERY != 0)
+            birds[index].trail_at = birds[index].trail_held = 0;
+        move_what_is_kept_for_a_bird(index, last);
+    }
+    forget_what_is_kept_for_a_bird(last);
+    config.birds = last;
+    the_sign_follows_the_traffic(-1);
+}
+
+static void take_out_hawk(int index) {
+    for (int h = index; h + 1 < config.hawks; h++) hawks[h] = hawks[h + 1];
+    config.hawks--;
+}
+
+/* What the neighbours can be told about this window, and what this window can do
+ * with what they say: once a frame. */
+static void sky_look_at_the_doors(void) {
+    open_edges.left = link_edge_open(&the_row, LINK_LEFT, LINK_BIRD);
+    open_edges.right = link_edge_open(&the_row, LINK_RIGHT, LINK_BIRD);
+    open_edges.hawk_left = link_edge_open(&the_row, LINK_LEFT, LINK_HAWK);
+    open_edges.hawk_right = link_edge_open(&the_row, LINK_RIGHT, LINK_HAWK);
+}
+
+/* The intro is a word the whole flock writes, each bird by its number, and nothing
+ * crosses while it is up: a bird that came in would be handed a letter, and one
+ * that went out would leave a hole in it. A sign is another thing, picked writers
+ * that hold their places and a free flock round them, and it is held for as long as
+ * it takes to read. */
+static int the_intro_is_being_written(void) {
+    return formation.writing && !formation.sign;
+}
+
+/* A bird that is writing a sign holds its place, scattered or not: it is not one of
+ * the free flock, and a sign with a hole in it for every bird the wind blew out of
+ * a door would be a sign the neighbour had half of. */
+static int a_bird_is_writing_a_sign(int index) {
+    return formation.writing && formation.sign && index >= 0 && index < MAX_BIRDS &&
+           formation.slot[index] >= 0;
+}
+
+/* Travellers that came when there was no place for them. A window that has said it
+ * is full has neighbours that have not heard it yet, two of them may post to it in
+ * the same frame, and a paused window takes nobody in: what comes in the meantime
+ * waits here, at the door, and comes in as places free, in the order it came,
+ * instead of being lost. As many birds as a window holds wait, and as many hawks as
+ * four windows do; past that, which takes a row of windows full at once, a
+ * traveller is let go. */
+enum { SKY_WAITING_HAWKS = 4 * MAX_HAWKS };
+static struct {
+    link_traveller_t birds[MAX_BIRDS];
+    int first_bird, birds_waiting;
+    link_traveller_t hawks[SKY_WAITING_HAWKS];
+    int hawks_waiting;
+} at_the_door;
+
+static void sky_keep_up(void) {
+    if (!the_row.opened) return;
+    link_update(&the_row, clock_state.seconds);
+    /* A window writing its intro has no room, and nor has one that is paused, so
+     * that nobody posts to it; and those at its door are as good as in. */
+    int room = !the_intro_is_being_written() && !paused;
+    link_set_room(&the_row,
+                  room && config.birds + at_the_door.birds_waiting < MAX_BIRDS - SKY_HEADROOM,
+                  room && config.hawks + at_the_door.hawks_waiting < MAX_HAWKS);
+    sky_look_at_the_doors();
+}
+
+/* A bird that comes in, at the end of the flock. */
+static void sky_bird_comes_in(bird_t *birds, const link_traveller_t *traveller) {
+    land_a_bird(&birds[config.birds], traveller);
+    forget_what_is_kept_for_a_bird(config.birds);
+    /* A picture colours every bird by its place in the array, flying or home; one
+     * that comes in keeps the colour it came with. */
+    picture_shade[config.birds] = birds[config.birds].shade;
+    config.birds++;
+    the_sign_follows_the_traffic(1);
+}
+
+static void sky_hawk_comes_in(const link_traveller_t *traveller) {
+    land_a_hawk(&hawks[config.hawks], traveller);
+    config.hawks++;
+}
+
+/* Whoever has come in since the last frame, at the end of the flock: first those
+ * that were waiting at the door, as places have freed, and then the new, which
+ * wait too while anybody is waiting before them or there is no place. */
+static void sky_take_in(bird_t *birds, int *live) {
+    link_traveller_t traveller;
+    if (!the_row.opened || the_intro_is_being_written()) return; /* They wait in the post. */
+    while (!paused && at_the_door.birds_waiting > 0 && config.birds < MAX_BIRDS) {
+        sky_bird_comes_in(birds, &at_the_door.birds[at_the_door.first_bird]);
+        at_the_door.first_bird = (at_the_door.first_bird + 1) % MAX_BIRDS;
+        at_the_door.birds_waiting--;
+    }
+    while (!paused && at_the_door.hawks_waiting > 0 && config.hawks < MAX_HAWKS) {
+        sky_hawk_comes_in(&at_the_door.hawks[0]);
+        at_the_door.hawks_waiting--;
+        memmove(at_the_door.hawks, at_the_door.hawks + 1,
+                sizeof(at_the_door.hawks[0]) * (size_t)at_the_door.hawks_waiting);
+    }
+    for (int taken = 0; taken < MAX_BIRDS && link_receive(&the_row, &traveller); taken++) {
+        if (traveller.kind == LINK_HAWK) {
+            if (!paused && at_the_door.hawks_waiting == 0 && config.hawks < MAX_HAWKS)
+                sky_hawk_comes_in(&traveller);
+            else if (at_the_door.hawks_waiting < SKY_WAITING_HAWKS)
+                at_the_door.hawks[at_the_door.hawks_waiting++] = traveller;
+        } else {
+            if (!paused && at_the_door.birds_waiting == 0 && config.birds < MAX_BIRDS)
+                sky_bird_comes_in(birds, &traveller);
+            else if (at_the_door.birds_waiting < MAX_BIRDS)
+                at_the_door
+                    .birds[(at_the_door.first_bird + at_the_door.birds_waiting++) % MAX_BIRDS] =
+                    traveller;
+        }
+    }
+    *live = config.birds;
+}
+
+/* A window that holds a sign keeps the birds it takes to write it: twice the cells
+ * the longest text of it lights (the clock's, through every minute), or half the
+ * birds its picture was drawn with. Between two holds every bird of it is free, and
+ * a door that took them all would leave a sign with nobody to write it. */
+static int birds_the_sign_keeps(void) {
+    if (!a_sign_is_asked_for()) return 0;
+    if (the_sign.kind == SIGN_PICTURE) return the_sign.drawn_with / 2;
+    return 2 * the_sign.budget;
+}
+
+/* Everything that has flown out through a door since the last frame is posted, the
+ * frame having been drawn with it still in: it is on the screen of the window it
+ * is leaving for the last time, and on the next one's in its next frame. A bird the
+ * neighbour will not take stays where it is, and tries again. */
+static void sky_hand_over(bird_t *birds, int *live) {
+    double half = config.bird_size / 2.0;
+    if (!the_row.opened || the_intro_is_being_written()) return;
+    for (int side = LINK_LEFT; side <= LINK_RIGHT; side++) {
+        int door = side == LINK_LEFT ? open_edges.left : open_edges.right;
+        int hawk_door = side == LINK_LEFT ? open_edges.hawk_left : open_edges.hawk_right;
+        link_traveller_t post[SKY_PER_FRAME];
+        int at[SKY_PER_FRAME], count = 0;
+        int may_go = config.birds - birds_the_sign_keeps();
+
+        /* From the end, so that taking one out moves nothing still to be sent. */
+        for (int i = config.birds - 1; door && i >= 0 && count < SKY_PER_FRAME && count < may_go;
+             i--) {
+            double middle = birds[i].x + half;
+            double reach = side == LINK_RIGHT ? middle - screen.width : -middle;
+            if (side == LINK_LEFT ? middle >= 0 : middle < screen.width) continue;
+            if (a_bird_is_writing_a_sign(i)) continue;
+            at[count] = i;
+            post[count++] = traveller_of_bird(&birds[i], reach);
+        }
+        int sent = link_send(&the_row, side, post, count);
+        for (int k = 0; k < sent; k++) take_out_bird(birds, at[k]);
+
+        for (int h = config.hawks - 1; hawk_door && h >= 0; h--) {
+            double x = hawks[h].x;
+            double reach = side == LINK_RIGHT ? x - screen.width : -x;
+            if (side == LINK_LEFT ? x >= 0 : x < screen.width) continue;
+            link_traveller_t traveller = traveller_of_hawk(&hawks[h], reach);
+            if (link_send(&the_row, side, &traveller, 1) == 1) take_out_hawk(h);
+        }
+    }
+    *live = config.birds;
+    sky_look_at_the_doors(); /* A neighbour that would not take one is not a door. */
+}
+
+static void sky_leave(void) {
+    link_close(&the_row);
+    memset(&open_edges, 0, sizeof(open_edges));
+    /* Those at the door go with the window, as the ones in it do. */
+    at_the_door.birds_waiting = at_the_door.hawks_waiting = at_the_door.first_bird = 0;
+}
+
+/* Joins the row of windows, or says why it cannot and ends the run: before the
+ * terminal is touched, so that the words are read where they are written. */
+static void sky_join(void) {
+    char directory[LINK_PATH_SIZE];
+    if (!share_the_sky) return;
+    if (!link_directory_for(directory, sizeof(directory), getenv("XDG_RUNTIME_DIR"),
+                            getenv("TMPDIR"), geteuid())) {
+        fprintf(stderr,
+                "%s: --link: the directory for the sky would be too long a path for a socket\n",
+                program_name);
+        exit(EXIT_FAILURE);
+    }
+    link_status_t status = link_open(&the_row, directory, 0);
+    if (status == LINK_OK) {
+        atexit(sky_leave);
+        return;
+    }
+    /* The words for the ones a person can put right. */
+    if (status == LINK_ERR_NOT_PRIVATE)
+        fprintf(stderr,
+                "%s: --link: %s can be written to by others, so it cannot hold the sky; "
+                "chmod 700 it or remove it\n",
+                program_name, directory);
+    else if (status == LINK_ERR_NOT_YOURS)
+        fprintf(stderr, "%s: --link: %s belongs to somebody else, so it cannot hold the sky\n",
+                program_name, directory);
+    else if (status == LINK_ERR_NOT_A_DIRECTORY)
+        fprintf(stderr,
+                "%s: --link: %s is not a directory (a link to one will not do); remove it\n",
+                program_name, directory);
+    else if (status == LINK_ERR_PATH_TOO_LONG)
+        fprintf(stderr,
+                "%s: --link: %s is too long a path for a socket; point TMPDIR or "
+                "XDG_RUNTIME_DIR at a shorter one\n",
+                program_name, directory);
+    else
+        fprintf(stderr, "%s: --link: %s %s: %s\n", program_name, directory,
+                link_status_string(status), strerror(errno));
+    exit(EXIT_FAILURE);
+}
+
+/* Move first, then draw, and move both the flock and the hawks before drawing
+ * either. Drawing first meant the frame on the screen held the birds from before
+ * the step and the hawks from after it — a hawk a whole step, forty pixels, ahead
+ * of the hole it had just made, which is not what the recorder drew and not what
+ * the physics said. Paused still draws and still reads keys, so the panel answers
+ * and the sliders can be explored on a still frame; a step grants one frame of
+ * motion and then stands still again. */
+static kitty_graphics_status_t render_frame(kitty_graphics_t *graphics, bird_t *birds,
+                                            bird_t *snapshot, spatial_grid_t *grid) {
+    if (!paused || step_once) {
+        step_once = 0;
+        fly(birds, snapshot, grid);
+    } else if (sky_mode) {
+        look_at_the_sky(birds);
+    }
+    return queue_render_frame(graphics, birds);
+}
+
+static void update_speed(void) {
+    double pixels_per_second = DEFAULT_SPEED * FRAME_RATE;
+    /* On a small screen, choose a safe velocity once at the scheduled rate: no
+     * more than a tenth of the shorter side in one frame at sixty. Do not cap the
+     * final step, because doing that every time a real frame is late silently
+     * lowers the velocity and recreates the FPS-dependent bug. Above about four
+     * hundred and fifty pixels tall this changes nothing. */
+    double shorter = screen.width < screen.height ? screen.width : screen.height;
+    double safe_per_second = shorter / 10.0 * FRAME_RATE;
+    if (shorter > 0 && pixels_per_second > safe_per_second) pixels_per_second = safe_per_second;
+    config.base_speed = pixels_per_second * frame_seconds;
+    /* The pace multiplies what the screen allows rather than being capped by it,
+     * so on a small screen every notch of the slider still does something. */
+    config.speed = config.base_speed * config.pace;
+}
+
+static void set_frame_seconds(double seconds) {
+    /* CLOCK_MONOTONIC may still return the same timestamp for an extremely short
+     * frame on a coarse clock. Zero time means zero movement, never a fallback to
+     * a full sixty-hertz step. */
+    frame_seconds = seconds > 0 ? seconds : 0;
+    update_speed();
+}
+
+static double notch_value(int notch, double minimum, double maximum) {
+    return minimum + (maximum - minimum) * notch / LEGEND_BAR_CELLS;
+}
+
+/* The inverse: which notch a real value belongs to. */
+static int notch_for_integer(int value, int minimum, int maximum) {
+    return ((value - minimum) * LEGEND_BAR_CELLS + (maximum - minimum) / 2) / (maximum - minimum);
+}
+
+static int notch_integer(int notch, int minimum, int maximum) {
+    return minimum + ((maximum - minimum) * notch + LEGEND_BAR_CELLS / 2) / LEGEND_BAR_CELLS;
+}
+
+/* Derives every tunable from its notch. Called after any key that moves one, so
+ * the values and the bars can never disagree. */
+static void apply_notches(void) {
+    config.boundary = notch_value(config.boundary_notch, BOUNDARY_MIN, BOUNDARY_MAX);
+    config.separation = notch_value(config.separation_notch, SEPARATION_MIN, SEPARATION_MAX);
+    config.alignment = notch_value(config.alignment_notch, ALIGNMENT_MIN, ALIGNMENT_MAX);
+
+    config.vision_radius = notch_integer(config.vision_notch, MIN_VISION_RADIUS, MAX_VISION_RADIUS);
+    config.vision_radius_squared = config.vision_radius * config.vision_radius;
+    /* The block of cells the search sweeps has to cover the radius, so it rounds
+     * up: a radius that is not a whole number of cells still needs the cell it
+     * reaches into. */
+    config.vision_cells = (config.vision_radius + SPATIAL_CELL_SIZE - 1) / SPATIAL_CELL_SIZE;
+
+    /* Counted in whole fifths rather than through notch_value, whose arithmetic
+     * lands a hair off one at the default: one times anything is that thing, so
+     * at the fourth notch the flock is bit for bit the one that shipped. */
+    config.pace = PACE_STEP * (config.pace_notch + 1);
+
+    /* Kin by halves below the fourth notch, room and wariness above it, and
+     * exactly none of any of it on it. */
+    config.avoid_kinship = 0;
+    config.avoid_room = 0;
+    config.avoid_weight = 0;
+    if (config.avoid_notch < DEFAULT_NOTCH) {
+        config.avoid_kinship = ldexp(1.0, -config.avoid_notch);
+    } else {
+        double above =
+            (config.avoid_notch - DEFAULT_NOTCH) / (double)(LEGEND_BAR_CELLS - DEFAULT_NOTCH);
+        config.avoid_room = 2 * above;
+        config.avoid_weight = AVOID_WEIGHT_MAX * above;
+    }
+    update_speed();
+}
+
+/* Left alone for this long, the sliders start wandering by themselves. */
+enum { IDLE_SECONDS = 60 };
+static int matrix_mode;
+/* What --matrix had in its place, for when there is text: text is not rain. */
+static int palette_before_the_rain, alignment_before_the_rain;
+static int unlock_fps;
+static int requested_perception = DEFAULT_VISION_RADIUS;
+static int requested_seed = -1;
+static int requested_preset = -1;
+
+/*
+ * A preset is the six notches together, because the interesting settings are
+ * combinations rather than single values, and naming one is how a look gets
+ * shared. The order is boundary, separation, alignment, perception, rate, which
+ * is the order the panel shows them in.
+ */
+typedef struct {
+    const char *name;
+    const char *help;
+    int notch[4];
+} preset_t;
+
+static const preset_t PRESETS[] = {
+    /* No preset takes the boundary below 7, whatever else it does. Under that a
+     * preset is not a look, it is a flock that spends its time outside the frame:
+     * school had one bird in nine off the screen. */
+    {"murmuration", "one great restless body, the starling look", {7, 3, 9, 8}},
+    {"swarm", "tight, fast and nervous, like insects", {7, 8, 3, 3}},
+    {"storm", "loose and violent, thrown about", {9, 10, 2, 6}},
+};
+enum { PRESET_COUNT = sizeof(PRESETS) / sizeof(*PRESETS) };
+static const char *PRESET_NAMES[PRESET_COUNT + 1];
+
+static void name_the_presets(void) {
+    for (int i = 0; i < PRESET_COUNT; i++) PRESET_NAMES[i] = PRESETS[i].name;
+    PRESET_NAMES[PRESET_COUNT] = NULL;
+}
+
+static void apply_preset(int which) {
+    const preset_t *preset = &PRESETS[which];
+    config.boundary_notch = preset->notch[0];
+    config.separation_notch = preset->notch[1];
+    config.alignment_notch = preset->notch[2];
+    config.vision_notch = preset->notch[3];
+    apply_notches();
+}
+
+/* The option table: the parser and the help text both come off this, so adding a
+ * switch is one row and never a second place to keep in step. */
+static const option_t OPTIONS[] = {
+    /* short, long, alias, kind, target, min, max, names, metavar, help, group, on -h */
+    {'n', "birds", NULL, OPTION_INT, &config.birds, 1, MAX_BIRDS, NULL, "COUNT",
+     "how many birds (default 800)", "Flock", 1},
+    {'s', "size", NULL, OPTION_INT, &config.bird_size, MIN_BIRD_SIZE, MAX_BIRD_SIZE, NULL, "PIXELS",
+     "sprite size in pixels (default 30)", "Flock", 1},
+    /* k is the hawk key in the panel, so k is the hawk flag on the line: -k 3 used
+     * to mean three flocks, which is a trap laid by the program's own help. */
+    {'g', "flocks", "groups", OPTION_INT, &config.flocks, 1, MAX_FLOCKS, NULL, "COUNT",
+     "flocks that keep to their own kind (default 1)", "Flock", 1},
+    {'k', "hawks", NULL, OPTION_INT, &config.hawks, 0, MAX_HAWKS, NULL, "COUNT",
+     "predators hunting the flock (default 0)", "Flock", 1},
+    {0, "preset", NULL, OPTION_ENUM, &requested_preset, 0, 0, PRESET_NAMES, "NAME",
+     "murmuration, swarm, storm", "Flock", 1},
+    {0, "seed", NULL, OPTION_INT, &requested_seed, 0, 2147483647, NULL, "N",
+     "the same seed gives the same flock", "Flock", 0},
+
+    {0, "boundary", NULL, OPTION_INT, &config.boundary_notch, 0, LEGEND_BAR_CELLS, NULL, "NOTCH",
+     "how hard the edges push back (default 4)", "Sliders   0 to 12, as the panel shows them", 0},
+    {0, "separation", NULL, OPTION_INT, &config.separation_notch, 0, LEGEND_BAR_CELLS, NULL,
+     "NOTCH", "how much a bird keeps its distance (default 4)",
+     "Sliders   0 to 12, as the panel shows them", 0},
+    {0, "alignment", NULL, OPTION_INT, &config.alignment_notch, 0, LEGEND_BAR_CELLS, NULL, "NOTCH",
+     "how much a bird matches its neighbours (default 4)",
+     "Sliders   0 to 12, as the panel shows them", 0},
+    {0, "turning", NULL, OPTION_INT, &config.turning_notch, 0, LEGEND_BAR_CELLS, NULL, "NOTCH",
+     "sharpest turn a frame, 12 is instant (default 8)",
+     "Sliders   0 to 12, as the panel shows them", 0},
+    {0, "perception", NULL, OPTION_INT, &requested_perception, MIN_VISION_RADIUS, MAX_VISION_RADIUS,
+     NULL, "PIXELS", "how far a bird sees, 12 to 60 (default 36)",
+     "Sliders   0 to 12, as the panel shows them", 0},
+    {0, "speed", NULL, OPTION_INT, &config.pace_notch, 0, LEGEND_BAR_CELLS, NULL, "NOTCH",
+     "how fast the flock flies, 0.2x to 2.6x (default 1, 0.4x)",
+     "Sliders   0 to 12, as the panel shows them", 0},
+    {0, "avoidance", NULL, OPTION_INT, &config.avoid_notch, 0, LEGEND_BAR_CELLS, NULL, "NOTCH",
+     "how much flocks keep out of each other's way (default 4)",
+     "Sliders   0 to 12, as the panel shows them", 0},
+
+    {'c', "color", "palette", OPTION_ENUM, &config.palette, 0, 0, PALETTE_NAMES, "RAMP",
+     "theme, ember, ice, acid, matrix, aurora, prism, potion, dusk, ash, gta6, ink", "Look", 1},
+    {0, "shape", NULL, OPTION_ENUM, &config.shape, 0, 0, SHAPE_NAMES, "NAME",
+     "bird, arrow, plane, dot", "Look", 1},
+    {0, "sprite", NULL, OPTION_STRING, &sprite_path, 0, 0, NULL, "FILE",
+     "a PNG you supply, kept in its own colours", "Look", 0},
+    {'e', "trails", NULL, OPTION_FLAG, &config.trails, 0, 0, NULL, NULL,
+     "faint tails behind the flock", "Look", 0},
+    {0, "depth", NULL, OPTION_FLAG, &deep_look, 0, 0, NULL, NULL,
+     "a second sky further off: smaller, slower, dimmer birds", "Look", 1},
+    {0, "3d", NULL, OPTION_FLAG, &sky_mode, 0, 0, NULL, NULL, "a murmuration in three dimensions",
+     "Look", 1},
+    {'l', "panel", NULL, OPTION_FLAG, &legend_enabled, 0, 0, NULL, NULL,
+     "the sliders in the corner from the start; h toggles them", "Look", 1},
+    {0, "render", NULL, OPTION_ENUM, &render_mode, 0, 0, RENDER_NAMES, "HOW",
+     "braille by default; sextants, blocks, or kitty in Kitty and Ghostty", "Look", 1},
+
+    {0, "say", NULL, OPTION_STRING, &say_text, 0, 0, NULL, "TEXT",
+     "the flock writes TEXT and holds it as a sign", "Sign", 0},
+    {0, "clock", NULL, OPTION_FLAG, &clock_mode, 0, 0, NULL, NULL,
+     "the flock tells the time, HH:MM, in local time", "Sign", 0},
+    {0, "clock-at", NULL, OPTION_STRING, &clock_start, 0, 0, NULL, "TIME",
+     "start the clock at HH:MM or HH:MM:SS, not now", "Sign", 0},
+    {0, "seconds", NULL, OPTION_FLAG, &clock_seconds, 0, 0, NULL, NULL,
+     "the clock shows the seconds too, HH:MM:SS", "Sign", 0},
+    {0, "font-size", "fontsize", OPTION_INT, &sign_font_rows, SIGN_FONT_ROWS_MIN,
+     SIGN_FONT_ROWS_MAX, NULL, "ROWS", "how many rows tall a sign's letters are, 4 to 10", "Sign",
+     0},
+    {0, "picture", NULL, OPTION_STRING, &picture_path, 0, 0, NULL, "FILE",
+     "the flock draws a PNG, in its colours unless --color is given", "Sign", 0},
+
+    {0, "matrix", NULL, OPTION_FLAG, &matrix_mode, 0, 0, NULL, NULL, "it is raining birds",
+     "Oddities", 0},
+    {0, "text", NULL, OPTION_STRING, &text_path, 0, 0, NULL, "FILE",
+     "a file whose letters take flight; text piped in does the same", "Oddities", 0},
+
+    {0, "bench", NULL, OPTION_INT, &bench_frames, 0, 1000000, NULL, "N",
+     "run N frames with no terminal, print the numbers, quit", "Output", 0},
+    {0, "frames", NULL, OPTION_INT, &frame_limit, 0, 1000000, NULL, "N",
+     "quit after N frames, for recording", "Output", 0},
+    {0, "snapshot", NULL, OPTION_STRING, &snapshot_path, 0, 0, NULL, "FILE",
+     "write the last frame as a PNG", "Output", 0},
+    {0, "record", NULL, OPTION_STRING, &record_path, 0, 0, NULL, "FILE",
+     "record a GIF, or a .cast for asciinema, with no terminal, and quit", "Output", 0},
+    {0, "record-fps", NULL, OPTION_INT, &record_fps, 2, MAX_CAST_FPS, NULL, "RATE",
+     "frames a second; a GIF can carry up to 50 (default 25)", "Output", 0},
+    {0, "record-seconds", NULL, OPTION_INT, &record_seconds, 1, 120, NULL, "SECONDS",
+     "how long the recording runs (default 6, 34 for text)", "Output", 0},
+    {0, "record-size", NULL, OPTION_STRING, &requested_record_size, 0, 0, NULL, "COLSxROWS",
+     "the size to record at, in cells (default 96x26)", "Output", 0},
+
+    {0, "unlock-fps", NULL, OPTION_FLAG, &unlock_fps, 0, 0, NULL, NULL,
+     "render as fast as the terminal allows", "General", 0},
+    {0, "screensaver", NULL, OPTION_FLAG, &screensaver_mode, 0, 0, NULL, NULL,
+     "quit at once on any key, click or movement, for tmux's lock-command", "General", 0},
+    {0, "link", NULL, OPTION_FLAG, &share_the_sky, 0, 0, NULL, NULL,
+     "share one sky with other cbirds --link windows", "General", 0},
+};
+enum { OPTION_COUNT = sizeof(OPTIONS) / sizeof(*OPTIONS) };
+
+/* The panel teaches the slider keys, so this only has to list the rest. */
+#define KEYS_HELP                                                                  \
+    "\nKeys   b/B s/S a/A t/T p/P v/V   one notch down / up\n"                     \
+    "       space pause   . step   0 reset   +/- birds   Tab preset\n"             \
+    "       h panel   e trails   k/K hawks   g/G flocks avoid, with two or more\n" \
+    "       enter letters off, or home (with text)   q quit\n"
+
+/* What --size and three of the sliders are in a space, where the rows above say
+ * what they are in the flat sky. */
+#define SPACE_HELP                                                                   \
+    "\nIn --3d  --size is the bird halfway into the flock (default 8, 5 in text),\n" \
+    "         --boundary the pull of the roost, --turning a turn a second, and\n"    \
+    "         --perception 12 to 60 the neighbours a bird heeds, 1 to 13\n"
+
+enum { EXIT_USAGE = 2 }; /* A mistyped command is not a run that went wrong. */
+
+static const option_example_t EXAMPLES[] = {
+    {"cbirds", "a flock in braille, and nothing to read"},
+    {"cbirds --preset murmuration", "the starling look"},
+    {"cbirds --hawks 2 --color ice", "something to watch"},
+    {"cbirds --flocks 3 --color ember", "three of them, keeping to their own"},
+    {"cbirds --depth --trails", "a second sky behind the first"},
+    {"cbirds --3d", "2000 birds in ink, seen from a slow orbit"},
+    {"cbirds --3d --hawks 1", "a murmuration, and a hawk through it"},
+    {"cbirds --render kitty", "sprites, in Kitty or Ghostty"},
+    {"cbirds --say \"back in five\"", "the flock writes it and holds it"},
+    {"cbirds --screensaver --clock", "a lock screen that tells the time"},
+    {"fastfetch | cbirds", "its letters take flight, and come home"},
+    {"cbirds --link", "one sky across several terminals"},
+    {"cbirds --record flock.gif", "a GIF, with no terminal in the way"},
+    {NULL, NULL},
+};
+
+/* Back to the shipped look, which is what someone reaches for after pressing
+ * every key to see what it does. */
+static void apply_preset_defaults(void) {
+    config.boundary_notch = DEFAULT_NOTCH;
+    config.separation_notch = DEFAULT_NOTCH;
+    config.alignment_notch = DEFAULT_NOTCH;
+    config.vision_notch = DEFAULT_VISION_NOTCH;
+    /* The banking as well: it was once off the panel, so somebody who had turned
+     * it down with t could not see what they did and had nothing else to undo it
+     * with. And the speed, which no preset touches, so this is its only way home. */
+    config.turning_notch = DEFAULT_TURNING_NOTCH;
+    config.pace_notch = letters_mode ? LETTERS_PACE_NOTCH : DEFAULT_PACE_NOTCH;
+    config.avoid_notch = DEFAULT_NOTCH;
+    apply_notches();
+}
+
+/* Reads the decimal digits at *text into *value and moves past them. sscanf's %d
+ * is undefined on a number too large for an int, and what the digits are is up
+ * to a terminal's reply or a command line, so the overflow is checked here. */
+static int read_decimal(const char **text, int *value) {
+    const char *at = *text;
+    int result = 0;
+    if (*at < '0' || *at > '9') return 0;
+    for (; *at >= '0' && *at <= '9'; at++) {
+        int digit = *at - '0';
+        if (result > (INT_MAX - digit) / 10) return 0;
+        result = result * 10 + digit;
+    }
+    *text = at;
+    *value = result;
+    return 1;
+}
+
+/* CSI < button ; column ; row M or m, one based, as mode 1006 sends it. */
+static void read_mouse_report(const char *sequence) {
+    int button, column, row;
+    const char *at = sequence + 1;
+    if (sequence[0] != '<') return;
+    if (!read_decimal(&at, &button) || *at++ != ';' || !read_decimal(&at, &column) ||
+        *at++ != ';' || !read_decimal(&at, &row))
+        return;
+    if (column < 1 || row < 1) return;
+    /* The pointer is in a cell of the screen. A terminal that reports it further off,
+     * dragged out of the window, or a report that was made up, is at the nearest
+     * edge: a billion columns is a position nothing here can turn into a cell. */
+    if (screen.cols > 0 && column > screen.cols) column = screen.cols;
+    if (screen.rows > 0 && row > screen.rows) row = screen.rows;
+    mouse.x = (column - 0.5) * screen.cell_width;
+    mouse.y = (row - 0.5) * screen.cell_height;
+    mouse.present = 1;
+    mouse.moved_at = clock_state.seconds;
+}
+
+/*
+ * Autopilot.
+ *
+ * A terminal left open on a second monitor becomes the demo for whoever walks
+ * past the chair, which is how a thing like this actually spreads. One notch
+ * every few seconds, of one slider at a time, so the change is always legible as
+ * a change rather than a new program. A keypress ends it, because fighting the
+ * user for a slider is worse than not moving it.
+ */
+static double last_key_at;
+static double last_drift_at;
+
+static void drift_a_slider(void) {
+    int *notches[] = {&config.boundary_notch, &config.separation_notch, &config.alignment_notch,
+                      &config.vision_notch};
+    enum { NOTCH_COUNT = sizeof(notches) / sizeof(*notches) };
+    int which = (int)(random_unit() * NOTCH_COUNT) % NOTCH_COUNT;
+    int *notch = notches[which];
+    int step = random_unit() < 0.5 ? -1 : 1;
+
+    /* Turned back at the ends rather than stuck against them. */
+    if (*notch + step < 0 || *notch + step > LEGEND_BAR_CELLS) step = -step;
+    *notch += step;
+    apply_notches();
+}
+
+/* It waits a minute to be sure nobody is watching. */
+static int flying_itself(void) {
+    return clock_state.seconds - last_key_at >= IDLE_SECONDS;
+}
+
+static void maybe_drift(void) {
+    if (!flying_itself()) return;
+    if (clock_state.seconds - last_drift_at < AUTOPILOT_PERIOD) return;
+    last_drift_at = clock_state.seconds;
+    drift_a_slider();
+}
+
+/*
+ * Up up down down left right left right b a.
+ *
+ * Listed in --help rather than hidden, because an easter egg nobody finds is
+ * wasted and the line itself is a screenshot. The arrows arrive as CSI final
+ * bytes, which the sequence reader already has in hand; b and a are the same
+ * keys that move the boundary and alignment sliders, so those move too, and
+ * nothing is lost by that.
+ */
+static const char KONAMI[] = "AABBDCDCba";
+enum { KONAMI_LENGTH = sizeof(KONAMI) - 1 };
+static char konami_seen[KONAMI_LENGTH];
+static int konami_at;
+
+static void konami_note(char key) {
+    /* The last ten keys, compared as a whole. A ring rather than a running match
+     * because people mash arrows, and a stutter should not throw the sequence
+     * away: AAABBDCDCba has the code in it and ought to count. */
+    konami_seen[konami_at % KONAMI_LENGTH] = key;
+    konami_at++;
+    if (konami_at < KONAMI_LENGTH) return;
+    for (int i = 0; i < KONAMI_LENGTH; i++)
+        if (konami_seen[(konami_at + i) % KONAMI_LENGTH] != KONAMI[i]) return;
+
+    konami_at = 0;
+    memset(konami_seen, 0, sizeof(konami_seen));
+    config.hawks = MAX_HAWKS;
+    place_hawks();
+}
+
+static int handle_input(void) {
+    static char sequence[32];
+    static size_t sequence_length;
+    char input[INPUT_BUFFER_SIZE];
+    ssize_t length = read(input_fd, input, sizeof(input));
+    if (length > 0) last_key_at = clock_state.seconds;
+    /* A screensaver goes at the first sign of anybody: a key, a click, a pointer
+     * that moves, an arrow. Whatever arrives in its first moments is what started
+     * it, or the terminal answering something, and is read and thrown away. After
+     * them it is the same reader as any other that sorts the bytes, so that a
+     * terminal's late reply to a question, an OSC or a DCS string, is not somebody:
+     * it is swallowed whole, and what is left is. */
+    int goes_at_a_key = screensaver_mode && !(clock_state.seconds < SCREENSAVER_GRACE &&
+                                              launch_lag <= SCREENSAVER_GRACE);
+    if (screensaver_mode && input_state == INPUT_ESCAPE && input_escape_at.tv_sec >= 0) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double waited = (double)(now.tv_sec - input_escape_at.tv_sec) +
+                        (double)(now.tv_nsec - input_escape_at.tv_nsec) / 1e9;
+        /* The Escape key: nothing came after it. */
+        if (waited > SCREENSAVER_ESCAPE_WAIT) {
+            input_state = INPUT_NORMAL;
+            if (goes_at_a_key) return 0;
+        }
+    }
+    if (length > 0 && (input_state == INPUT_STRING || input_state == INPUT_STRING_ESCAPE)) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double quiet = (double)(now.tv_sec - input_string_at.tv_sec) +
+                       (double)(now.tv_nsec - input_string_at.tv_nsec) / 1e9;
+        if (quiet > INPUT_STRING_PATIENCE) input_state = INPUT_NORMAL;
+        input_string_at = now;
+    }
+    for (ssize_t i = 0; i < length; i++) {
+        unsigned char key = (unsigned char)input[i];
+        int *notch = NULL, step = 0;
+        if (input_state == INPUT_STRING) {
+            /* A reply that came late, or in pieces: none of it is a key. */
+            if (key == '\a' && input_string_kind == ']')
+                input_state = INPUT_NORMAL;
+            else if (key == '\033')
+                input_state = INPUT_STRING_ESCAPE;
+            else if (++input_string_length > INPUT_STRING_LONGEST)
+                input_state = INPUT_NORMAL;
+            continue;
+        }
+        if (input_state == INPUT_STRING_ESCAPE) {
+            if (key == '\\') {
+                input_state = INPUT_NORMAL;
+                continue;
+            }
+            /* An escape inside a string ends it and begins something else. */
+            input_state = INPUT_ESCAPE;
+        }
+        if (input_state == INPUT_ESCAPE) {
+            if (key == '[' || key == 'O') {
+                /* An arrow, a click, a pointer on the move: somebody, and no need
+                 * to wait for the end of it. */
+                if (goes_at_a_key) {
+                    input_state = INPUT_NORMAL;
+                    return 0;
+                }
+                input_state = INPUT_SEQUENCE;
+                sequence_length = 0;
+            } else if (key == ']' || key == 'P') {
+                begin_a_string((char)key);
+            } else if (key == '\033') {
+                wait_on_an_escape(goes_at_a_key);
+            } else {
+                input_state = INPUT_NORMAL;
+                if (goes_at_a_key) return 0; /* Alt with a key. */
+            }
+            continue;
+        }
+        if (input_state == INPUT_SEQUENCE) {
+            /* A final byte ends the sequence; everything before it is its body.
+             * Anything longer than the buffer is not a report we know. */
+            if (key >= 0x40 && key <= 0x7e) {
+                input_state = INPUT_NORMAL;
+                if (screensaver_mode) continue; /* Nothing it says is for the flock. */
+                sequence[sequence_length] = '\0';
+                if (key == 'M' || key == 'm')
+                    read_mouse_report(sequence);
+                else if (sequence_length == 0)
+                    konami_note((char)key); /* A bare arrow, not a modified one. */
+                continue;
+            }
+            if (sequence_length + 1 < sizeof(sequence)) sequence[sequence_length++] = (char)key;
+            continue;
+        }
+        if (key == '\033') {
+            input_state = INPUT_ESCAPE;
+            wait_on_an_escape(goes_at_a_key);
+            continue;
+        }
+        if (screensaver_mode) {
+            if (goes_at_a_key) return 0;
+            continue; /* Not even q: it is not a key for anything yet. */
+        }
+
+        if (key == 'b' || key == 'a') konami_note((char)key);
+        /* Any key ends the intro; the pointer does not. A sign is for reading, and
+         * the keys are for the flock: they leave it up. */
+        if (!formation.sign) formation_clear();
+        switch (key) {
+            case 'q':
+                return 0;
+            case ' ':
+                paused = !paused;
+                continue;
+            case '.':
+                step_once = 1; /* One frame of motion, then still again. */
+                continue;
+            case '0':
+                apply_preset_defaults();
+                continue;
+            case '\r': /* Enter: the letters off, or home. */
+            case '\n':
+                if (letters_mode) letters_poke(&the_letters);
+                continue;
+            case '+':
+            case '=':
+                /* The text decides how many letters there are. */
+                if (!letters_mode && config.birds < MAX_BIRDS) {
+                    config.birds += config.birds / 4 + 1;
+                    if (config.birds > MAX_BIRDS) config.birds = MAX_BIRDS;
+                    population_changed = 1;
+                }
+                continue;
+            case '-':
+                if (!letters_mode && config.birds > 1) {
+                    config.birds -= config.birds / 5 + 1;
+                    if (config.birds < 1) config.birds = 1;
+                    population_changed = 1;
+                }
+                continue;
+            case 'h':
+                legend_enabled = !legend_enabled;
+                measure_legend();
+                update_turn_distances();
+                continue;
+            case 'k':
+                if (hawk_sets_built && config.hawks < MAX_HAWKS) {
+                    config.hawks++;
+                    place_one_hawk(config.hawks - 1);
+                }
+                continue;
+            case 'K':
+                if (config.hawks > 0) config.hawks--;
+                continue;
+            case 'T':
+                if (config.turning_notch < LEGEND_BAR_CELLS) config.turning_notch++;
+                continue;
+            case 't':
+                if (config.turning_notch > 0) config.turning_notch--;
+                continue;
+            case 'e':
+                /* A tail behind a letter is a smear of the text it is made of, and a
+                 * space draws none. */
+                if (!letters_mode && !sky_mode) config.trails = !config.trails;
+                continue;
+            case '\t':
+                requested_preset = (requested_preset + 1) % PRESET_COUNT;
+                apply_preset(requested_preset);
+                continue;
+            case 'B':
+                notch = &config.boundary_notch;
+                step = 1;
+                break;
+            case 'b':
+                notch = &config.boundary_notch;
+                step = -1;
+                break;
+            case 'S':
+                notch = &config.separation_notch;
+                step = 1;
+                break;
+            case 's':
+                notch = &config.separation_notch;
+                step = -1;
+                break;
+            case 'A':
+                notch = &config.alignment_notch;
+                step = 1;
+                break;
+            case 'a':
+                notch = &config.alignment_notch;
+                step = -1;
+                break;
+            case 'P':
+                notch = &config.vision_notch;
+                step = 1;
+                break;
+            case 'p':
+                notch = &config.vision_notch;
+                step = -1;
+                break;
+            case 'V':
+                notch = &config.pace_notch;
+                step = 1;
+                break;
+            case 'v':
+                notch = &config.pace_notch;
+                step = -1;
+                break;
+            case 'G':
+            case 'g':
+                /* Nothing to avoid with one flock, and no row to show it on. */
+                if (config.flocks < 2) continue;
+                notch = &config.avoid_notch;
+                step = key == 'G' ? 1 : -1;
+                break;
+            default:
+                continue;
+        }
+        *notch += step;
+        if (*notch < 0) *notch = 0;
+        if (*notch > LEGEND_BAR_CELLS) *notch = LEGEND_BAR_CELLS;
+        apply_notches();
+    }
+    return 1;
+}
+
+static int wait_for_terminal_io(void) {
+    int result;
+    do {
+        /* The sets are rebuilt each time round: select leaves in them only what was
+         * ready. */
+        fd_set readable, writable;
+        FD_ZERO(&readable);
+        FD_ZERO(&writable);
+        FD_SET(input_fd, &readable);
+        FD_SET(STDOUT_FILENO, &writable);
+        result = select((input_fd > STDOUT_FILENO ? input_fd : STDOUT_FILENO) + 1, &readable,
+                        &writable, NULL, NULL);
+    } while (result < 0 && errno == EINTR);
+    return result < 0 ? -1 : 0;
+}
+
+#define CBIRDS_VERSION "1.8.0"
+
+/*
+ * The program writes its own PNG, with its own encoder.
+ *
+ * Compositing is the one thing the renderer never has to do, because Kitty does
+ * it: so a snapshot rebuilds the rotated sprites as pixels, alpha blends every
+ * bird into one canvas, and hands it to png_encode. Fifty milliseconds and a few
+ * megabytes for a still, which is a fair price for a picture that the README can
+ * honestly say the program drew of itself.
+ */
+/* `mix` blends the sprite's edges with what is under them, which is what a
+ * picture wants. Without it the more opaque pixel simply takes the place: what a
+ * text terminal wants, because a cell's colour is read back from its pixels and
+ * a blend of two tints where two birds overlap is a colour that is neither —
+ * ten thousand of them a recording, each a colour sequence of its own. */
+static void blend_sprite(png_image_t *canvas, const png_image_t *sprite, int at_x, int at_y,
+                         int mix) {
+    for (int y = 0; y < sprite->height; y++) {
+        int cy = at_y + y;
+        if (cy < 0 || cy >= canvas->height) continue;
+        for (int x = 0; x < sprite->width; x++) {
+            int cx = at_x + x;
+            if (cx < 0 || cx >= canvas->width) continue;
+            const uint8_t *src =
+                sprite->pixels + ((size_t)y * (size_t)sprite->width + (size_t)x) * 4;
+            uint8_t *dst = canvas->pixels + ((size_t)cy * (size_t)canvas->width + (size_t)cx) * 4;
+            unsigned alpha = src[3];
+            if (alpha == 0) continue;
+            if (!mix) {
+                if (alpha > dst[3]) memcpy(dst, src, 4);
+                continue;
+            }
+            /* Straight alpha over, done properly: the colour underneath counts
+             * only for as much of it as is there. Blending against a transparent
+             * pixel as if it were opaque black darkened every anti-aliased edge,
+             * which on a text terminal — where the cell's colour is the mean of
+             * its pixels — made every bird a slightly different shade and every
+             * cell a fresh colour sequence. */
+            unsigned under = dst[3] * (255 - alpha) / 255;
+            unsigned out_alpha = alpha + under;
+            for (int c = 0; c < 3; c++)
+                dst[c] = (uint8_t)((src[c] * alpha + dst[c] * under) / out_alpha);
+            dst[3] = (uint8_t)out_alpha;
+        }
+    }
+}
+
+/* The rotated sprites as pixels, which is what compositing needs and the
+ * renderer never does, because Kitty does it. */
+/*
+ * Every shade, and the hawks' bigger silhouette after them, laid out exactly as
+ * the image ids are: shade major, then the hawk set. A snapshot that rasterised
+ * one shade and used it for every bird was a picture of a flock that does not
+ * exist, which is what the README's stills and the demo were until now.
+ */
+/* A wing beat, seen from above, is the span foreshortening: the sprite is
+ * squashed across the axis of flight and set back in the middle of its square. */
+static png_status_t squash_wings(const png_image_t *square, double span, png_image_t *out) {
+    int height = (int)(square->height * span + 0.5);
+    if (height < 1) height = 1;
+    png_image_t narrow = {0, 0, NULL};
+    png_status_t status = png_resize(square, square->width, height, &narrow);
+    if (status == PNG_OK) status = png_image_alloc(out, square->width, square->height);
+    if (status == PNG_OK) {
+        int top = (square->height - height) / 2;
+        for (int y = 0; y < height; y++)
+            memcpy(out->pixels + ((size_t)(top + y) * (size_t)out->width) * 4,
+                   narrow.pixels + (size_t)y * (size_t)narrow.width * 4, (size_t)narrow.width * 4);
+    }
+    png_image_free(&narrow);
+    return status;
+}
+
+static void fade_alpha(png_image_t *image, double factor) {
+    size_t count = (size_t)image->width * (size_t)image->height;
+    for (size_t i = 0; i < count; i++)
+        image->pixels[i * 4 + 3] = (uint8_t)(image->pixels[i * 4 + 3] * factor + 0.5);
+}
+
+/* A far bird's tint: the shade's own, pulled toward the ground. */
+static void far_tint(png_image_t *image, int shade) {
+    const palette_t *chosen = palette();
+    if (sprite_path != NULL || chosen->tints == NULL) {
+        /* Artwork of somebody's own keeps its colours and is only dimmed. */
+        png_tint(image, 150, 150, 150, PNG_TINT_MULTIPLY);
+        return;
+    }
+    if (shade >= chosen->shades) shade = chosen->shades - 1;
+    uint8_t rgb[3];
+    pulled_towards(chosen->tints[shade], picture_ground(), FAR_DIM, rgb);
+    png_tint(image, rgb[0], rgb[1], rgb[2], chosen->mode);
+}
+
+/* What distance does to a bird in three dimensions: smaller, which the bin's size
+ * says, and dimmer, which is this. The nearest bin is the ramp's first shade as it
+ * is and the farthest its last, pulled a quarter of the way to the ground as well.
+ * A farther bird has to be fainter than the ramp's darkest shade says, or the
+ * flock has no depth to it; and at half way, which is what looked best on a
+ * picture, the farthest bin was a contrast of 1.4 against the ground, which in a
+ * terminal is not there at all. At a quarter it is two to one, the contrast the
+ * ramps themselves are kept to, and the nearest is seventeen. */
+static const double SKY_DIM = 0.25;
+
+static void tint_sky(png_image_t *image, int bin) {
+    const palette_t *chosen = palette();
+    double far = (double)(SKY_BINS - 1 - bin) / (SKY_BINS - 1);
+    double dim = SKY_DIM * far;
+    if (sprite_path != NULL || chosen->tints == NULL) {
+        uint8_t level = (uint8_t)(255 * (1 - dim) + 0.5);
+        png_tint(image, level, level, level, PNG_TINT_MULTIPLY);
+        return;
+    }
+    int shade = (int)(far * (chosen->shades - 1) + 0.5);
+    uint8_t rgb[3];
+    pulled_towards(chosen->tints[shade], picture_ground(), dim, rgb);
+    png_tint(image, rgb[0], rgb[1], rgb[2], chosen->mode);
+}
+
+/* One geometry — a size and a wing span — rotated once per frame, and every set
+ * that shares it copied and tinted from that. Rotation is the expensive half and
+ * does not depend on the colour. */
+typedef void (*tint_fn)(png_image_t *image, int argument);
+
+static void tint_flock(png_image_t *image, int shade) {
+    palette_tint(image, shade);
+}
+static void tint_hawk(png_image_t *image, int unused) {
+    (void)unused;
+    hawk_tint(image);
+}
+static void tint_trail(png_image_t *image, int step) {
+    palette_tint(image, palette_shades() / 2);
+    fade_alpha(image, TRAIL_ALPHA[step]);
+}
+
+static png_status_t rasterise_geometry(const png_image_t *source, png_image_t *frames, int size,
+                                       double span, const int *sets, const int *arguments,
+                                       int count, tint_fn tint) {
+    png_image_t square = {0, 0, NULL}, squashed = {0, 0, NULL};
+    int work = size * SPRITE_SUPERSAMPLE;
+    if (work > SPRITE_WORK_MAX) work = SPRITE_WORK_MAX;
+    if (work > source->width) work = source->width;
+    png_status_t status = png_resize(source, work, work, &square);
+    if (status == PNG_OK && span < 1.0) {
+        status = squash_wings(&square, span, &squashed);
+        png_image_free(&square);
+        square = squashed;
+    }
+    for (int i = 0; i < ROTATION_FRAMES && status == PNG_OK; i++) {
+        png_image_t base = {0, 0, NULL};
+        status = png_rotate_resize(&square, i * FRAME_ANGLE * M_PI / 180.0, size, size, &base);
+        for (int k = 0; k < count && status == PNG_OK; k++) {
+            png_image_t *frame = &frames[sets[k] * ROTATION_FRAMES + i];
+            status = png_image_alloc(frame, base.width, base.height);
+            if (status != PNG_OK) break;
+            memcpy(frame->pixels, base.pixels, (size_t)base.width * (size_t)base.height * 4);
+            tint(frame, arguments[k]);
+        }
+        png_image_free(&base);
+    }
+    png_image_free(&square);
+    return status;
+}
+
+/* A sign is read at the size of its letters, and a bird of thirty pixels on a
+ * letter whose cells are twelve apart is a smudge: on an eighty column terminal
+ * it was not a word any more. So when --size was not given a sign's bird is as
+ * wide as the distance between two cells of its letters, and never more than the
+ * usual thirty. This is the same fit the sign is laid out by, on the screen as it
+ * is, with a margin of its own since the bird's size is what is being chosen. */
+static int sign_bird_size(void) {
+    if (screen.width <= 0 || screen.height <= 0) return DEFAULT_BIRD_SIZE;
+    char clean[SIGN_TEXT_MAX];
+    sign_lines_t lines;
+    double cell;
+    const double margin = 40;
+    if (the_sign.kind == SIGN_PICTURE) {
+        /* The distance between neighbours, as the picture will have them. */
+        picture_fit_t fit = picture_fit(&picture_image, margin, margin, screen.width - 2 * margin,
+                                        screen.height - 2 * margin);
+        int size = (int)(sqrt(fit.width * fit.height * picture_ink / config.birds) + 0.5);
+        return size < MIN_BIRD_SIZE ? MIN_BIRD_SIZE
+                                    : (size > DEFAULT_BIRD_SIZE ? DEFAULT_BIRD_SIZE : size);
+    }
+    if (the_sign.kind == SIGN_CLOCK)
+        sign_clean(the_sign.seconds ? "00:00:00" : "00:00", clean, sizeof(clean));
+    else
+        snprintf(clean, sizeof(clean), "%s", sign_words);
+    double used_width, used_height;
+    if (sign_fit_in(clean, 0, screen.width - 2 * margin, screen.height - 2 * margin, 1e9, &lines,
+                    &cell, &used_width, &used_height) == 0)
+        return DEFAULT_BIRD_SIZE;
+    int size = (int)(cell + 0.5);
+    return size < MIN_BIRD_SIZE ? MIN_BIRD_SIZE
+                                : (size > DEFAULT_BIRD_SIZE ? DEFAULT_BIRD_SIZE : size);
+}
+
+/* How much of its length and of its span a bird shows in each of its shapes. A
+ * bird seen from the side is long and, from above and level, spread; seen head
+ * on it is short, and the wings that were out are edge on. The spans are the beat
+ * of the flat flock's, so that a bird flapping face on to the camera runs through
+ * them, and one seen along its wings stays at the last. */
+static const double SKY_LENGTH[SKY_ALONG_LEVELS] = {1.0, 0.5};
+static const double SKY_SPAN[SKY_ACROSS_LEVELS] = {1.0, 0.62, 0.34};
+
+/* Squashed along the axis of flight as well as across it, and set back in the
+ * middle of its square. */
+static png_status_t squash_axes(const png_image_t *square, double length, double span,
+                                png_image_t *out) {
+    int width = (int)(square->width * length + 0.5), height = (int)(square->height * span + 0.5);
+    if (width < 1) width = 1;
+    if (height < 1) height = 1;
+    png_image_t narrow = {0, 0, NULL};
+    png_status_t status = png_resize(square, width, height, &narrow);
+    if (status == PNG_OK) status = png_image_alloc(out, square->width, square->height);
+    if (status == PNG_OK) {
+        int left = (square->width - width) / 2, top = (square->height - height) / 2;
+        for (int y = 0; y < height; y++)
+            memcpy(out->pixels + ((size_t)(top + y) * (size_t)out->width + (size_t)left) * 4,
+                   narrow.pixels + (size_t)y * (size_t)narrow.width * 4, (size_t)narrow.width * 4);
+    }
+    png_image_free(&narrow);
+    return status;
+}
+
+/* One shape of one bin, at every heading. */
+static png_status_t rasterise_the_sky_shape(const png_image_t *source, png_image_t *frames, int bin,
+                                            int shape) {
+    png_image_t square = {0, 0, NULL}, squashed = {0, 0, NULL};
+    int size = sky_bin_size(bin), set = flock_set(0, shape, bin);
+    int work = size * SPRITE_SUPERSAMPLE;
+    if (work > SPRITE_WORK_MAX) work = SPRITE_WORK_MAX;
+    if (work > source->width) work = source->width;
+    png_status_t status = png_resize(source, work, work, &square);
+    double length = SKY_LENGTH[shape / SKY_ACROSS_LEVELS],
+           span = SKY_SPAN[shape % SKY_ACROSS_LEVELS];
+    if (status == PNG_OK && (length < 1.0 || span < 1.0)) {
+        status = squash_axes(&square, length, span, &squashed);
+        png_image_free(&square);
+        square = squashed;
+    }
+    for (int i = 0; i < ROTATION_FRAMES && status == PNG_OK; i++) {
+        png_image_t *frame = &frames[set * ROTATION_FRAMES + i];
+        status = png_rotate_resize(&square, i * FRAME_ANGLE * M_PI / 180.0, size, size, frame);
+        if (status == PNG_OK) tint_sky(frame, bin);
+    }
+    png_image_free(&square);
+    return status;
+}
+
+/* Before anything is sized from the bird: thirty pixels under every renderer
+ * when --size was not given, or what fits the letters when it is a sign. */
+static void settle_the_bird_size(void) {
+    if (config.bird_size != 0) return;
+    if (sky_mode)
+        config.bird_size = drawing_with_text() ? SKY_TEXT_BIRD_SIZE : SKY_BIRD_SIZE;
+    else
+        config.bird_size = a_sign_is_asked_for() ? sign_bird_size() : DEFAULT_BIRD_SIZE;
+}
+
+static png_status_t rasterise_sprites(png_image_t *frames) {
+    png_image_t source = {0, 0, NULL};
+    settle_the_bird_size();
+    png_status_t status = load_sprite(&source);
+    if (status != PNG_OK) return status;
+    int shades = palette_shades();
+    int sets[MAX_PALETTE_SHADES], arguments[MAX_PALETTE_SHADES];
+
+    /* In three dimensions a bin is a size and a tint, and every shape of each. */
+    if (sky_mode) sky_picture_size = (int)sky_picture(screen.width, screen.height);
+    for (int bin = 0; sky_mode && bin < SKY_BINS && status == PNG_OK; bin++)
+        for (int shape = 0; shape < SKY_SHAPES && status == PNG_OK; shape++)
+            status = rasterise_the_sky_shape(&source, frames, bin, shape);
+    /* Near birds: one geometry a wing phase, every shade off each. */
+    for (int wing = 0; !sky_mode && wing < WING_PHASES && status == PNG_OK; wing++) {
+        for (int shade = 0; shade < shades; shade++) {
+            sets[shade] = flock_set(shade, wing, 0);
+            arguments[shade] = shade;
+        }
+        status = rasterise_geometry(&source, frames, config.bird_size, WING_SPAN[wing], sets,
+                                    arguments, shades, tint_flock);
+    }
+    /* Far birds: smaller, wings out, dimmed. */
+    if (status == PNG_OK && !sky_mode) {
+        int far_size = (int)(config.bird_size * FAR_SIZE + 0.5);
+        if (far_size < MIN_BIRD_SIZE) far_size = MIN_BIRD_SIZE;
+        for (int shade = 0; shade < shades; shade++) {
+            sets[shade] = flock_set(shade, 0, 1);
+            arguments[shade] = shade;
+        }
+        status =
+            rasterise_geometry(&source, frames, far_size, 1.0, sets, arguments, shades, far_tint);
+    }
+    /* Hawks, at twice the size, at each wing phase, and in a space at each size.
+     * There the nearest is drawn from the sprite and the others are it made
+     * smaller: drawing each from the sprite again was two thirds of the time a
+     * space took to build, with or without a hawk in it. */
+    for (int wing = 0; wing < WING_PHASES && status == PNG_OK; wing++) {
+        int nearest = sky_mode ? SKY_BINS - 1 : 0, argument = 0;
+        int set = hawk_set(nearest * WING_PHASES + wing);
+        status = rasterise_geometry(&source, frames,
+                                    sky_mode ? hawk_size_in_layer(nearest) : hawk_sprite_size(),
+                                    WING_SPAN[wing], &set, &argument, 1, tint_hawk);
+        for (int bin = 0; bin < nearest && status == PNG_OK; bin++) {
+            int smaller = hawk_set(bin * WING_PHASES + wing), size = hawk_size_in_layer(bin);
+            for (int i = 0; i < ROTATION_FRAMES && status == PNG_OK; i++)
+                status = png_resize(&frames[set * ROTATION_FRAMES + i], size, size,
+                                    &frames[smaller * ROTATION_FRAMES + i]);
+        }
+    }
+    /* Tails: one geometry, a set a step of fading. Not in three dimensions, where a
+     * tail would have to be a set for every size. */
+    if (status == PNG_OK && !sky_mode) {
+        int trail_size = (int)(config.bird_size * TRAIL_SIZE + 0.5);
+        if (trail_size < MIN_BIRD_SIZE) trail_size = MIN_BIRD_SIZE;
+        int trail_sets[TRAIL_LENGTH], steps[TRAIL_LENGTH];
+        for (int step = 0; step < TRAIL_LENGTH; step++) {
+            trail_sets[step] = trail_set(step);
+            steps[step] = step;
+        }
+        status = rasterise_geometry(&source, frames, trail_size, 1.0, trail_sets, steps,
+                                    TRAIL_LENGTH, tint_trail);
+    }
+    png_image_free(&source);
+    return status;
+}
+
+static void free_sprites(png_image_t *frames) {
+    for (int i = 0; i < ROTATION_FRAMES * MAX_SPRITE_SETS; i++) png_image_free(&frames[i]);
+}
+
+/*
+ * A window of another size wants birds of another size, in a space.
+ *
+ * The flat flock's birds are as big as --size says in whatever window they fly,
+ * but a space is framed to fill the picture and its birds are a share of the
+ * picture, so a terminal made twice as big showed the same flock at half the
+ * size, every bird a speck. The sprites are rebuilt, then, when the picture is
+ * a different size; and not before it has stayed that size for a third of a
+ * second, because dragging a corner is a new size every frame and a rebuild is a
+ * pause of a few hundredths of a second. A change of under a twentieth is not
+ * worth the pause, and the birds are a pixel off at most.
+ */
+enum { RESIZE_SETTLE_FRAMES = 20 };
+static const double RESIZE_WORTH = 0.05;
+static int picture_held_for, picture_last_seen;
+
+static int the_sprites_are_for_another_picture(void) {
+    if (!sky_mode || sky_picture_size <= 0) return 0;
+    double now = sky_picture(screen.width, screen.height);
+    return fabs(now - sky_picture_size) >= RESIZE_WORTH * sky_picture_size;
+}
+
+typedef enum { SPRITES_FIT, SPRITES_REBUILT, SPRITES_FAILED } sprite_fit_t;
+
+/* Called every frame, after the window has been measured. A failure is the
+ * caller's to report, as it is at startup. A rebuild is the caller's to tell the
+ * clock about: it takes between a third of a second and two, as it does at
+ * startup, and the flock should wait for it, not fly on through it. */
+static sprite_fit_t fit_the_sprites_to_the_window(kitty_graphics_t *graphics) {
+    if (!sky_mode) return SPRITES_FIT;
+    int picture = (int)sky_picture(screen.width, screen.height);
+    picture_held_for = picture == picture_last_seen ? picture_held_for + 1 : 0;
+    picture_last_seen = picture;
+    if (picture_held_for < RESIZE_SETTLE_FRAMES || !the_sprites_are_for_another_picture())
+        return SPRITES_FIT;
+
+    free_sprites(text_sprites);
+    if (rasterise_sprites(text_sprites) != PNG_OK) return SPRITES_FAILED;
+    if (render_mode != RENDER_KITTY) return SPRITES_REBUILT;
+    /* Kitty keeps what it was sent, under the same ids, so the new images replace
+     * the old; and the placements are all made again every frame. */
+    kitty_graphics_status_t status = upload_sprite_sets(graphics, text_sprites);
+    free_sprites(text_sprites);
+    return status == KITTY_GRAPHICS_OK ? SPRITES_REBUILT : SPRITES_FAILED;
+}
+
+/* The ground, opaque, so a picture looks like the terminal it was taken in
+ * rather than like a cut out. */
+static void fill_ground(png_image_t *canvas) {
+    const uint8_t *ground = picture_ground();
+    for (size_t i = 0; i < (size_t)canvas->width * (size_t)canvas->height; i++) {
+        canvas->pixels[i * 4 + 0] = ground[0];
+        canvas->pixels[i * 4 + 1] = ground[1];
+        canvas->pixels[i * 4 + 2] = ground[2];
+        canvas->pixels[i * 4 + 3] = 255;
+    }
+}
+
+/* The same order the live renderer places in: tails, then the flock, then the
+ * hawks over the top. On a ground for a picture; on nothing at all for a text
+ * terminal, whose own background is the sky and whose cells must not paint it. */
+static void compose_onto(png_image_t *canvas, const png_image_t *frames, const bird_t *birds,
+                         int with_ground) {
+    int shades = palette_shades();
+    if (with_ground)
+        fill_ground(canvas);
+    else
+        memset(canvas->pixels, 0, (size_t)canvas->width * (size_t)canvas->height * 4);
+
+    for (int pass = 0; pass < layer_count(); pass++) {
+        int layer = layer_in_pass(pass);
+        if (layer == 0 && config.trails && !sky_mode) {
+            for (int i = 0; i < config.birds; i += TRAIL_EVERY) {
+                if (birds[i].layer != 0) continue;
+                for (int step = 0; step < birds[i].trail_held; step++) {
+                    int age = (birds[i].trail_at - 1 - step + TRAIL_LENGTH) % TRAIL_LENGTH;
+                    const png_image_t *sprite = &frames[trail_set(step) * ROTATION_FRAMES +
+                                                        birds[i].frame % ROTATION_FRAMES];
+                    if (sprite->pixels != NULL)
+                        blend_sprite(canvas, sprite, (int)birds[i].trail_x[age],
+                                     (int)birds[i].trail_y[age], with_ground);
+                }
+            }
+        }
+        for (int i = 0; i < config.birds; i++) {
+            if (birds[i].layer != layer) continue;
+            int set = flock_set(birds[i].shade % shades, bird_wing(&birds[i]), birds[i].layer);
+            const png_image_t *sprite =
+                &frames[set * ROTATION_FRAMES + birds[i].frame % ROTATION_FRAMES];
+            if (sprite->pixels == NULL) continue;
+            blend_sprite(canvas, sprite, (int)birds[i].x, (int)birds[i].y, with_ground);
+        }
+    }
+    for (int i = 0; i < config.hawks; i++) {
+        int set = hawk_set(hawk_wing(&hawks[i]));
+        const png_image_t *sprite =
+            &frames[set * ROTATION_FRAMES + hawks[i].frame % ROTATION_FRAMES];
+        if (sprite->pixels == NULL) continue;
+        blend_sprite(canvas, sprite, (int)hawks[i].x - hawk_offset_of(&hawks[i]),
+                     (int)hawks[i].y - hawk_offset_of(&hawks[i]), with_ground);
+    }
+}
+
+/* A picture of what is on the screen. Under Kitty that is the sprites on a
+ * ground; on a text terminal it is the dots or the blocks, painted the way the
+ * terminal shows them, because a snapshot of the pixels the cells were read from
+ * would be a picture of something nobody saw. */
+static int write_snapshot(const char *path, const bird_t *birds) {
+    png_image_t canvas = {0, 0, NULL};
+    static png_image_t frames[ROTATION_FRAMES * MAX_SPRITE_SETS];
+    uint8_t *encoded = NULL;
+    size_t encoded_length = 0;
+    int written = 0;
+    const uint8_t *ground = picture_ground();
+
+    png_status_t status = PNG_OK;
+    if (drawing_with_text()) {
+        if (cells_paint(&text_cells, letters_mode ? CELLS_TEXT : text_style(), &canvas,
+                        letters_mode ? LETTER_PICTURE_WIDTH : screen.cell_width,
+                        letters_mode ? LETTER_PICTURE_HEIGHT : screen.cell_height,
+                        ground) != CELLS_OK)
+            status = PNG_ERR_MEMORY;
+    } else {
+        status = rasterise_sprites(frames);
+        if (status == PNG_OK) status = png_image_alloc(&canvas, screen.width, screen.height);
+        if (status == PNG_OK) compose_onto(&canvas, frames, birds, 1);
+    }
+    if (status == PNG_OK) {
+        status = png_encode(&canvas, &encoded, &encoded_length);
+    }
+    free_sprites(frames);
+    png_image_free(&canvas);
+
+    if (status == PNG_OK) {
+        FILE *out = fopen(path, "wb");
+        if (out != NULL) {
+            written = fwrite(encoded, 1, encoded_length, out) == encoded_length;
+            /* A full disk may only say so when the buffer is flushed on close. */
+            if (fclose(out) != 0) written = 0;
+        }
+    }
+    free(encoded);
+    return written;
+}
+
+static void usage(FILE *out, const char *program, int everything) {
+    options_usage(out, program, "cbirds \u2014 a flock of birds in your terminal.", EXAMPLES,
+                  OPTIONS, OPTION_COUNT, everything);
+    if (everything) fputs(KEYS_HELP SPACE_HELP, out);
+}
+
+/* HH:MM or HH:MM:SS, as many digits as the person felt like typing. */
+static int read_clock_start(const char *text, int *hour, int *minute, int *second) {
+    const char *at = text;
+    *second = 0;
+    if (!read_decimal(&at, hour) || *at++ != ':' || !read_decimal(&at, minute)) return 0;
+    if (*at == ':' && (at++, !read_decimal(&at, second))) return 0;
+    return *at == '\0' && *hour < 24 && *minute < 60 && *second < 60;
+}
+
+/* The picture, read once and for the whole run, and its colours worked out: cut
+ * down to a ramp by median cut, and either they are the palette, or, when --color
+ * was given, they are only how light and how dark the picture goes. A file that
+ * is not a PNG, or too large, is an error like a bad --sprite, said the same way;
+ * a picture with no ink in it is only a picture the flock has nothing to draw. */
+static void settle_the_picture(void) {
+    png_status_t status = load_png_file(picture_path, "a picture", &picture_image);
+    if (status != PNG_OK) {
+        fprintf(stderr, "%s: %s: %s\n", program_name, picture_path, png_status_string(status));
+        exit(EXIT_FAILURE);
+    }
+    /* Kept no larger than a thousand pixels across: the picture is laid out again
+     * whenever the window changes size, and the birds draw it at a fraction of
+     * that. A photograph of forty megapixels would cost a quarter of a second a
+     * time to cut up; this costs fifteen milliseconds, whatever came in. */
+    int longest =
+        picture_image.width > picture_image.height ? picture_image.width : picture_image.height;
+    if (longest > PICTURE_KEPT_MAX) {
+        png_image_t smaller = {0, 0, NULL};
+        int width = (int)((double)picture_image.width * PICTURE_KEPT_MAX / longest + 0.5);
+        int height = (int)((double)picture_image.height * PICTURE_KEPT_MAX / longest + 0.5);
+        if (png_resize(&picture_image, width > 0 ? width : 1, height > 0 ? height : 1, &smaller) ==
+            PNG_OK) {
+            png_image_free(&picture_image);
+            picture_image = smaller;
+        }
+    }
+    uint8_t colours[MAX_PALETTE_SHADES][3];
+    int made = picture_quantise(&picture_image, MAX_PALETTE_SHADES, colours);
+    if (made == 0) {
+        fprintf(stderr, "%s: %s has nothing opaque in it, so the flock flies as usual\n",
+                program_name, picture_path);
+        png_image_free(&picture_image);
+        return;
+    }
+    /* A bird of the picture's black is a bird nobody can see: the picture's dark is
+     * kept for ranking shades, and the colours the birds wear are lifted, towards
+     * white, until they stand as clear of the ground as the ramps' own do. */
+    picture_dark = picture_luminance(colours[made - 1]);
+    picture_light = picture_luminance(colours[0]); /* Lightest first. */
+    for (int c = 0; c < made; c++)
+        for (int step = 0; step < 32 && contrast_between(colours[c], PICTURE_GROUND) < 1.8; step++)
+            for (int channel = 0; channel < 3; channel++) {
+                int lifted = colours[c][channel] + (255 - colours[c][channel]) / 12 + 1;
+                colours[c][channel] = (uint8_t)(lifted > 255 ? 255 : lifted);
+            }
+    size_t pixels = (size_t)picture_image.width * (size_t)picture_image.height, ink = 0;
+    for (size_t i = 0; i < pixels; i++) ink += picture_image.pixels[i * 4 + 3] > 127;
+    picture_ink = (double)ink / (double)pixels;
+    memcpy(picture_tints, colours, sizeof(picture_tints));
+    picture_palette.shades = made;
+    picture_palette.tints = (const uint8_t(*)[3])picture_tints;
+    picture_colours_in_use = !palette_was_asked_for;
+    if (sprite_path != NULL)
+        fprintf(stderr, "%s: --sprite keeps its own colours, so the picture is drawn in them\n",
+                program_name);
+    the_sign.kind = SIGN_PICTURE;
+}
+
+/* The options that make the flock a sign, settled together: which one it is,
+ * whether the font can draw it, and what the clock is going by. Said out loud
+ * and then ignored where the flock can simply fly as usual, and refused where
+ * the command is a mistake. */
+static void settle_the_sign(void) {
+    int hour = 0, minute = 0, second = 0;
+    if (clock_start != NULL) {
+        if (!read_clock_start(clock_start, &hour, &minute, &second)) {
+            fprintf(stderr, "%s: --clock-at wants HH:MM or HH:MM:SS, not '%s'\n", program_name,
+                    clock_start);
+            exit(EXIT_USAGE);
+        }
+        clock_mode = 1;
+    }
+    if (clock_seconds) clock_mode = 1; /* As --clock-at, a clock on its own. */
+    if ((say_text != NULL) + clock_mode + (picture_path != NULL) > 1) {
+        fprintf(stderr, "%s: --say, --clock and --picture each take the whole sign, so only one\n",
+                program_name);
+        exit(EXIT_USAGE);
+    }
+    the_sign.seed = requested_seed >= 0 ? (unsigned)requested_seed : 0u;
+    if (picture_path != NULL) settle_the_picture();
+    if (say_text != NULL) {
+        int kept = sign_clean(say_text, sign_words, sizeof(sign_words));
+        int needs = font_text_cells(sign_words);
+        if (kept == 0) {
+            fprintf(stderr,
+                    "%s: --say has nothing the font can draw, so the flock flies as usual\n",
+                    program_name);
+        } else if (needs > FORMATION_MAX_TARGETS) {
+            fprintf(stderr, "%s: --say is too long to write, so the flock flies as usual\n",
+                    program_name);
+        } else if (needs > config.birds) {
+            fprintf(stderr,
+                    "%s: that text takes %d birds to write and the flock has %d, so the flock "
+                    "flies as usual\n",
+                    program_name, needs, config.birds);
+        } else {
+            the_sign.kind = SIGN_SAY;
+        }
+    }
+    if (clock_mode) {
+        the_sign.kind = SIGN_CLOCK;
+        the_sign.seconds = clock_seconds;
+        /* The locale's own idea of the hour, and nothing else of it: only the
+         * names of things in time are asked of it. */
+        setlocale(LC_TIME, "");
+        the_sign.twelve_hours = sign_wants_twelve_hours(nl_langinfo(T_FMT));
+        /* A recording runs on its own clock and not the wall's, so the time it tells
+         * is the time it started at, moved on by its own frames. */
+        the_sign.virtual_clock = record_path != NULL || bench_frames > 0 || clock_start != NULL;
+        the_sign.origin = time(NULL);
+        if (clock_start != NULL) {
+            struct tm today;
+            if (localtime_r(&the_sign.origin, &today) != NULL) {
+                today.tm_hour = hour;
+                today.tm_min = minute;
+                today.tm_sec = second;
+                today.tm_isdst = -1;
+                the_sign.origin = mktime(&today);
+            }
+        }
+    }
+}
+
+/* The option that asks for a sign, or NULL if none does. It goes by what was
+ * typed and not by what came of it: --say with nothing the font can draw is no sign
+ * and the flock flies as usual, but it was still asked for, and a command that asks
+ * for a sign and for text is a mistake whichever of them turns out to be nothing. */
+static const char *the_sign_option(void) {
+    if (say_text != NULL) return "--say";
+    if (clock_start != NULL) return "--clock-at";
+    if (clock_seconds) return "--seconds";
+    if (clock_mode) return "--clock";
+    if (picture_path != NULL) return "--picture";
+    return NULL;
+}
+
+/* Things that each want to be the whole flock. The text is the flock, and a sign
+ * is what the flock writes: text that is the flock leaves nobody to write a sign. A
+ * space is the flock in another sky altogether: a text and a sign are both made on
+ * the flat one, with its screen to lay them out on, and a space has no screen, only
+ * a camera. The one or the other, said in one line and with the status of the other
+ * usage errors, before anything is read or opened. Text on a pipe is said when it
+ * is found. */
+static void refuse_what_does_not_go_together(void) {
+    const char *sign = the_sign_option();
+    /* A shared sky is a live thing: it is the other windows, as they are now. */
+    if (share_the_sky && (bench_frames > 0 || record_path != NULL)) {
+        fprintf(stderr, "%s: --link does not go with %s: it joins the windows that are open\n",
+                program_name, bench_frames > 0 ? "--bench" : "--record");
+        exit(EXIT_USAGE);
+    }
+    /* The post carries a position, a heading and a look, and nothing else, so what
+     * a bird is outside bird_t does not travel with it. */
+    if (share_the_sky && sky_mode) {
+        fprintf(stderr,
+                "%s: --link does not go with --3d: a bird's place in a space does not travel\n",
+                program_name);
+        exit(EXIT_USAGE);
+    }
+    if (share_the_sky && text_path != NULL) {
+        fprintf(stderr,
+                "%s: --link does not go with --text: a letter's home is in its own window\n",
+                program_name);
+        exit(EXIT_USAGE);
+    }
+    if (sky_mode && text_path != NULL) {
+        fprintf(stderr, "%s: --3d does not go with --text: a text is laid out on the flat sky\n",
+                program_name);
+        exit(EXIT_USAGE);
+    }
+    if (sky_mode && sign != NULL) {
+        fprintf(stderr, "%s: --3d does not go with %s: a sign is drawn on the flat sky\n",
+                program_name, sign);
+        exit(EXIT_USAGE);
+    }
+    if (sky_mode && (config.flocks > 1 || matrix_mode)) {
+        fprintf(stderr, "%s: --3d is one flock over one roost; %s is for the flat sky\n",
+                program_name, matrix_mode ? "--matrix" : "--flocks");
+        exit(EXIT_USAGE);
+    }
+    if (sign != NULL && text_path != NULL) {
+        fprintf(stderr, "%s: %s does not go with --text: the text is the flock\n", program_name,
+                sign);
+        exit(EXIT_USAGE);
+    }
+}
+
+/* What does not fly in a space, said once and plainly rather than ignored. */
+static void settle_the_space(void) {
+    if (deep_look) {
+        fprintf(stderr, "%s: --3d replaces --depth: every bird has its own distance\n",
+                program_name);
+        deep_look = 0;
+    }
+    if (config.trails) {
+        fprintf(stderr, "%s: --3d draws no tails\n", program_name);
+        config.trails = 0;
+    }
+}
+
+static void read_options(int argc, char **argv) {
+    char error[160];
+    if (argc > 0 && argv[0] != NULL) program_name = argv[0];
+    name_the_palettes();
+    name_the_presets();
+    name_the_shapes();
+    /* What the mode says it flies with, when nothing was asked for: the count and
+     * the colours of a murmuration are not those of the flat sky, and a value
+     * cannot be told from the default once it is set, so the two are held back
+     * as not given and put back below. A picture draws in its own colours unless
+     * --color says otherwise, and the ramp it names is index zero, theme, by
+     * default. */
+    int flat_birds = config.birds, flat_palette = config.palette;
+    config.birds = 0;
+    config.palette = -1;
+    options_status_t status =
+        options_parse(OPTIONS, OPTION_COUNT, argc, argv, error, sizeof(error));
+
+    if (status == OPTIONS_HELP || status == OPTIONS_HELP_FULL) {
+        usage(stdout, program_name, status == OPTIONS_HELP_FULL);
+        exit(EXIT_SUCCESS);
+    }
+    if (status == OPTIONS_COMPLETION) {
+        if (!options_completion(stdout, error, "cbirds", OPTIONS, OPTION_COUNT)) {
+            fprintf(stderr, "%s: --completion wants bash, zsh or fish\n", program_name);
+            exit(EXIT_USAGE);
+        }
+        exit(EXIT_SUCCESS);
+    }
+    if (status == OPTIONS_VERSION) {
+        printf("cbirds %s\n", CBIRDS_VERSION);
+        exit(EXIT_SUCCESS);
+    }
+    if (status != OPTIONS_OK) {
+        /* Told what was wrong, and where to look, and exiting two rather than one
+         * so a script can tell a mistyped command from a run that went wrong. */
+        fprintf(stderr, "%s: %s\n", program_name, error);
+        fprintf(stderr, "Try '%s --help'.\n", program_name);
+        exit(EXIT_USAGE);
+    }
+    /* What was asked for wins, even when it is the very thing the flock ships with:
+     * the name of the default ramp, given, is a ramp given, and a picture then
+     * wears it. --matrix names a ramp too, the green one, and a picture beside it is
+     * drawn in that: the rain is green, and a picture in its own colours would be
+     * the one thing in it that is not. */
+    refuse_what_does_not_go_together();
+    palette_was_asked_for = config.palette >= 0 || matrix_mode;
+    if (config.birds == 0) config.birds = sky_mode ? SKY_BIRDS : flat_birds;
+    if (config.palette < 0) config.palette = sky_mode ? palette_named("ink") : flat_palette;
+    if (sky_mode) settle_the_space();
+    /* A preset is expanded first so that a slider given after it still wins: the
+     * table cannot express that order, so the parser's left to right reading is
+     * honoured by putting the broad stroke before the fine ones. */
+    if (requested_preset >= 0) {
+        int boundary = config.boundary_notch, separation = config.separation_notch;
+        int alignment = config.alignment_notch;
+        apply_preset(requested_preset);
+        if (boundary != DEFAULT_NOTCH) config.boundary_notch = boundary;
+        if (separation != DEFAULT_NOTCH) config.separation_notch = separation;
+        if (alignment != DEFAULT_NOTCH) config.alignment_notch = alignment;
+        if (requested_perception != DEFAULT_VISION_RADIUS)
+            config.vision_notch =
+                notch_for_integer(requested_perception, MIN_VISION_RADIUS, MAX_VISION_RADIUS);
+    } else {
+        /* The notch is the state the keys move, so a value off that grid could
+         * not be one: snap what was asked for to the nearest. */
+        config.vision_notch =
+            notch_for_integer(requested_perception, MIN_VISION_RADIUS, MAX_VISION_RADIUS);
+    }
+    apply_notches();
+    /* Checked here rather than where it is used, so every mode reports a bad
+     * sprite the same way and none of them gets halfway into a run first. */
+    if (sprite_path != NULL) {
+        png_image_t probe = {0, 0, NULL};
+        png_status_t sprite_status = load_sprite(&probe);
+        if (sprite_status != PNG_OK) {
+            fprintf(stderr, "%s: %s: %s\n", program_name, sprite_path,
+                    png_status_string(sprite_status));
+            exit(EXIT_FAILURE);
+        }
+        png_image_free(&probe);
+    }
+    settle_the_sign();
+    if (requested_record_size != NULL) {
+        int columns = 0, rows = 0;
+        const char *at = requested_record_size;
+        if (!read_decimal(&at, &columns) || *at++ != 'x' || !read_decimal(&at, &rows) ||
+            *at != '\0' || columns < 40 || columns > 400 || rows < 14 || rows > 120) {
+            fprintf(stderr, "%s: --record-size wants COLUMNSxROWS, 40x14 to 400x120, not '%s'\n",
+                    program_name, requested_record_size);
+            exit(EXIT_USAGE);
+        }
+        record_columns = columns;
+        record_rows = rows;
+    }
+    /* A palette with one colour in it cannot tell the flocks apart, which is worth
+     * saying out loud rather than letting somebody wonder where their three flocks
+     * went. */
+    if (config.flocks == 1 && config.avoid_notch != DEFAULT_NOTCH)
+        fprintf(stderr, "%s: --avoidance is how flocks avoid each other, and there is one\n",
+                program_name);
+    if (config.flocks > 1 && palette_shades() <= 1)
+        fprintf(stderr, "%s: %s has one colour, so the %d flocks will look like one\n",
+                program_name, palette()->name, config.flocks);
+    /* It is raining birds: green, falling, wrapping, with tails. Every part of it
+     * is a switch that already existed, which is the whole joke. */
+    if (matrix_mode) {
+        palette_before_the_rain = config.palette;
+        alignment_before_the_rain = config.alignment_notch;
+        config.palette = palette_named("matrix");
+        config.trails = 1;
+        config.alignment_notch = LEGEND_BAR_CELLS;
+        the_rain_is_falling = 1;
+        apply_notches();
+    }
+}
+
+/* The rain, stopped, and everything it changed put back as it was asked for. */
+static void stop_the_rain(void) {
+    if (!matrix_mode) return;
+    matrix_mode = 0;
+    config.palette = palette_before_the_rain;
+    config.alignment_notch = alignment_before_the_rain;
+    config.trails = 0;
+    the_rain_is_falling = 0;
+    apply_notches();
+}
+
+static void forget_the_text(void) {
+    free(the_text);
+    the_text = NULL;
+    the_text_length = 0;
+}
+
+/*
+ * Where the keys come from, and where the text does.
+ *
+ * Text piped in takes the standard input, so the keys have to come from the
+ * terminal itself: its controlling one, /dev/tty. That is not new ground, the
+ * program only ever asked its standard input for two things, keys and answers to
+ * its colour questions, and both go through one descriptor now.
+ */
+static void open_the_keys(void) {
+    if (isatty(STDIN_FILENO)) return;
+    int fd = open("/dev/tty", O_RDWR);
+    if (fd < 0) {
+        fprintf(stderr,
+                "%s: needs a terminal, and standard input is not one and /dev/tty cannot be "
+                "opened: %s\n",
+                program_name, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    input_fd = fd;
+}
+
+/* The file --text names, opened, or the reason it cannot be and an end to the run.
+ * main opens it first, so that a name that is wrong is the first thing said, and
+ * the reading takes that same descriptor: a second open of a named pipe would lose
+ * what the first was sent, and wait for ever for a writer that has gone. */
+static int text_fd = -1;
+
+static int open_the_text_file(void) {
+    int fd = open(text_path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "%s: cannot open %s: %s\n", program_name, text_path, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    return fd;
+}
+
+/* How much of a pipe is read, and for how long. A command that prints and ends is
+ * read to its end; one that never ends (tail -f) is read until it has been quiet
+ * for a moment, or has gone on long enough, or has sent a megabyte, and the text is
+ * what it had sent by then. One that sends nothing at all is given a few seconds,
+ * and then the flock flies as it always did. */
+static const letters_reading_t PIPE_READING = {3.0, 1.5, 8.0, 1 << 20};
+
+/*
+ * Takes the text from --text or from a pipe, lays it out on a screen of this many
+ * cells, and makes the letters the flock. Returns whether it did: no text, empty
+ * text, and text with nothing to see in it leave the flock as it is. `pipes` says
+ * whether a standard input that is not a terminal counts, which a benchmark has no
+ * business assuming.
+ */
+static int take_the_text(int cols, int rows, int pipes) {
+    int fd = -1, opened = 0;
+    if (text_path != NULL && strcmp(text_path, "-") != 0) {
+        fd = text_fd >= 0 ? text_fd : open_the_text_file();
+        text_fd = -1;
+        opened = 1;
+    } else if (text_path != NULL) {
+        if (isatty(STDIN_FILENO)) {
+            fprintf(stderr, "%s: --text - reads standard input, and that is a terminal\n",
+                    program_name);
+            exit(EXIT_USAGE);
+        }
+        fd = STDIN_FILENO;
+    } else if (pipes && !isatty(STDIN_FILENO)) {
+        fd = STDIN_FILENO;
+    }
+    if (fd < 0) return 0;
+
+    vt_t vt;
+    if (vt_init(&vt, cols, rows) != 0) {
+        fprintf(stderr, "%s: out of memory\n", program_name);
+        exit(EXIT_FAILURE);
+    }
+    size_t bytes = 0;
+    free(the_text);
+    the_text = NULL;
+    errno = 0;
+    letters_read_end_t end = letters_read(&vt, fd, &PIPE_READING, &bytes, &the_text);
+    int why = errno;
+    the_text_length = bytes;
+    if (opened) close(fd);
+    if (end == LETTERS_READ_ERROR && text_path != NULL) {
+        if (why != 0)
+            fprintf(stderr, "%s: cannot read %s: %s\n", program_name, text_path, strerror(why));
+        else
+            fprintf(stderr, "%s: cannot read %s\n", program_name, text_path);
+        exit(EXIT_FAILURE);
+    }
+    int count = end == LETTERS_READ_ERROR
+                    ? 0
+                    : letters_build(&the_letters, &vt, DEFAULT_CELL_WIDTH, DEFAULT_CELL_HEIGHT,
+                                    MAX_LETTERS, random_unit);
+    vt_destroy(&vt);
+    if (count < 0) {
+        fprintf(stderr, "%s: out of memory\n", program_name);
+        exit(EXIT_FAILURE);
+    }
+    if (count == 0) {
+        forget_the_text();
+        if (text_path != NULL)
+            fprintf(stderr, "%s: nothing to see in %s, so here are birds\n", program_name,
+                    text_path);
+        return 0;
+    }
+
+    if (sky_mode) {
+        fprintf(stderr,
+                "%s: --3d does not go with text on standard input: a text is laid out on the flat "
+                "sky\n",
+                program_name);
+        exit(EXIT_USAGE);
+    }
+    if (the_sign_option() != NULL) {
+        fprintf(stderr, "%s: %s does not go with text on standard input: the text is the flock\n",
+                program_name, the_sign_option());
+        exit(EXIT_USAGE);
+    }
+    if (share_the_sky) {
+        fprintf(stderr,
+                "%s: --link does not go with text on standard input: a letter's home is in its "
+                "own window\n",
+                program_name);
+        exit(EXIT_USAGE);
+    }
+    letters_mode = 1;
+    config.birds = count;
+    /* --matrix and --sprite are for birds: the rain's ramp and alignment go back to
+     * what was asked for, and a letter, which has no sprite, flies in the ramp. */
+    stop_the_rain();
+    sprite_path = NULL;
+    /* A cell is eight pixels across, a quarter of the sprite the pace was tuned for:
+     * at the default a letter crosses two cells a frame and the eye sees it skip,
+     * and at the slowest it is a cell a frame, which is a flight a letter can be
+     * followed in. A speed that was asked for is left alone. */
+    if (config.pace_notch == DEFAULT_PACE_NOTCH) config.pace_notch = LETTERS_PACE_NOTCH;
+    apply_notches();
+    /* One flock, on one plane, with no tails and no rain: the text is what is
+     * flying, and the things that would draw over it are for birds. */
+    config.flocks = 1;
+    deep_look = 0;
+    config.trails = 0;
+    the_rain_is_falling = 0;
+    return 1;
+}
+
+static const double REFLOW_SETTLE_SECONDS = 0.3;
+
+/* The window has a size the letters were not laid out for. The text is laid out
+ * again on this one, as it would have been had the command run here, and the cycle
+ * begins again from the text at rest: a letter in the air has nowhere to land on a
+ * grid that is gone. Waits until the size has held still for a moment, so that
+ * dragging a corner is not a layout a frame. Returns whether it laid out afresh.
+ *
+ * When it cannot, because nothing of the text is left on the new screen (it has
+ * scrolled off) or there is no memory, the letters stay as they were, with the size
+ * they were laid out for: their arrays are that big and no bigger, and a size that
+ * said otherwise would have the painting run past them. */
+static int reflow_the_letters(bird_t **birds, bird_t **snapshot) {
+    if (!letters_mode || the_text == NULL) return 0;
+    if ((screen.cols == the_letters.cols && screen.rows == the_letters.rows) ||
+        (screen.cols == reflow_empty_cols && screen.rows == reflow_empty_rows)) {
+        reflow_wait = 0;
+        return 0;
+    }
+    reflow_wait += frame_seconds;
+    if (reflow_wait < REFLOW_SETTLE_SECONDS) return 0;
+    reflow_wait = 0;
+
+    vt_t vt;
+    if (vt_init(&vt, screen.cols, screen.rows) != 0) return 0;
+    vt_feed(&vt, the_text, letters_text_end(the_text, the_text_length));
+    vt_finish(&vt);
+    letters_t fresh;
+    int count = letters_build(&fresh, &vt, DEFAULT_CELL_WIDTH, DEFAULT_CELL_HEIGHT, MAX_LETTERS,
+                              random_unit);
+    vt_destroy(&vt);
+    bird_t *grown = count > 0 ? malloc(sizeof(**birds) * (size_t)count) : NULL;
+    bird_t *grown_snapshot = count > 0 ? malloc(sizeof(**snapshot) * (size_t)count) : NULL;
+    if (count <= 0 || grown == NULL || grown_snapshot == NULL) {
+        free(grown);
+        free(grown_snapshot);
+        letters_destroy(&fresh);
+        /* Nothing to show is the same on every try at this size; no memory may not be. */
+        if (count == 0) {
+            reflow_empty_cols = screen.cols;
+            reflow_empty_rows = screen.rows;
+        }
+        return 0;
+    }
+    free(*birds);
+    free(*snapshot);
+    *birds = grown;
+    *snapshot = grown_snapshot;
+    letters_destroy(&the_letters);
+    the_letters = fresh;
+    config.birds = count;
+    place_the_letters(*birds);
+    memcpy(*snapshot, *birds, sizeof(**birds) * (size_t)count);
+    return 1;
+}
+
+static long elapsed_microseconds(const struct timespec *start, const struct timespec *end) {
+    return (end->tv_sec - start->tv_sec) * 1000000L + (end->tv_nsec - start->tv_nsec) / 1000L;
+}
+
+static double elapsed_seconds(const struct timespec *start, const struct timespec *end) {
+    return (double)(end->tv_sec - start->tv_sec) + (double)(end->tv_nsec - start->tv_nsec) / 1e9;
+}
+
+/* The terminal can still impose backpressure; unlocked means this program adds
+ * no wait of its own. Kept as arithmetic outside the loop so both halves of the
+ * switch are testable without making a test spend time asleep. */
+static long frame_delay_after(long elapsed) {
+    if (unlock_fps) return 0;
+    long remaining = 1000000L / FRAME_RATE - elapsed;
+    return remaining > 0 ? remaining : 0;
+}
+
+/*
+ * The numbers, with no terminal in the way.
+ *
+ * What the README claims about this program should be measurable by anyone who
+ * clones it, so the measurement is a flag rather than a paragraph. No terminal is
+ * opened and nothing is drawn: the frame is built into the graphics buffer and
+ * its length counted, which is exactly what a real frame would put on the wire.
+ */
+/*
+ * Hundredths of a second a frame, for a rate asked for in frames a second.
+ *
+ * A GIF carries its delay as whole hundredths, so the only rates it has are
+ * 100/1, 100/2, 100/3 and so on, and viewers clamp anything under two hundredths
+ * up to a tenth of a second. Fifty is therefore the ceiling and sixty is not a
+ * rate a GIF has at all: whatever is asked for is rounded to one it does.
+ */
+static int record_delay_for(int fps) {
+    int best = 100 / MAX_RECORD_FPS;
+    double error = -1;
+    /* Chosen by the error in the rate, not by rounding the delay: the two are not
+     * the same, because the rate is a hundred over the delay. Rounding gives 50
+     * for 41 frames a second where 33 is nearer to it. */
+    for (int delay = 100 / MAX_RECORD_FPS; delay <= 100; delay++) {
+        double mistake = 100.0 / delay - fps;
+        if (mistake < 0) mistake = -mistake;
+        if (error < 0 || mistake < error) {
+            error = mistake;
+            best = delay;
+        }
+    }
+    return best;
+}
+
+/*
+ * Recording.
+ *
+ * Headless, like the benchmark, and for the same reason: the demo in the README
+ * has to be regenerable by anyone who clones this, with one command, and nothing
+ * about it should depend on a terminal being attached or on how fast one happens
+ * to be. Every frame is simulated, every --record-every'th is composited and
+ * handed to the GIF writer.
+ */
+/* Headless there is no terminal to ask what colours it uses, so the palette that
+ * follows the terminal has nothing in it: black birds on a black ground, which is
+ * what `cbirds --record flock.gif` — the example in the help — recorded. Both the
+ * modes that never open a terminal fall back to the shipped ramp. */
+static void settle_the_palette_without_a_terminal(void) {
+    if (palette_follows_the_theme()) config.palette = FALLBACK_PALETTE;
+    if (palette_is_ink()) config.palette = FALLBACK_INK;
+}
+
+/* Six seconds is a flock's clip. A text's is a cycle: four seconds at rest, a wave
+ * of one, a flight of up to twenty-two, and four to come home, and the text whole
+ * again for the last two. */
+enum { FLOCK_RECORD_SECONDS = 6, TEXT_RECORD_SECONDS = 34 };
+
+static void settle_the_recording_length(void) {
+    if (record_seconds == 0)
+        record_seconds = letters_mode ? TEXT_RECORD_SECONDS : FLOCK_RECORD_SECONDS;
+}
+
+/* A recording does not start a wave it has no time to finish. A short flight lands
+ * the letters well before the clip ends, and the rest after it is shorter than
+ * what is left: the clip would end with them in the air again, and a GIF, which
+ * loops, would jump from there to the text at rest. The first wave always goes;
+ * after a cycle the text rests to the end unless a whole cycle more fits. */
+static void hold_the_last_rest(double seconds_left) {
+    if (!letters_mode || the_letters.phase != LETTERS_AT_REST || the_letters.cycles == 0) return;
+    if (seconds_left > LETTERS_WAVE_DEADLINE + LETTERS_FLIGHT_MOST + LETTERS_HOMING_DEADLINE + 1)
+        return;
+    if (the_letters.rest_left < seconds_left + 1) the_letters.rest_left = seconds_left + 1;
+}
+
+/* JSON needs its control characters spelled out, and an escape sequence is
+ * nothing but control characters and text. Everything else, braille included,
+ * goes through as the UTF-8 it already is. */
+static void write_json_string(FILE *out, const char *text, size_t length) {
+    fputc('"', out);
+    for (size_t i = 0; i < length; i++) {
+        unsigned char c = (unsigned char)text[i];
+        if (c == '"' || c == '\\')
+            fprintf(out, "\\%c", c);
+        else if (c < 0x20)
+            fprintf(out, "\\u%04x", c);
+        else
+            fputc(c, out);
+    }
+    fputc('"', out);
+}
+
+/*
+ * The recording as text: an asciinema cast, which is a JSON header and then
+ * one line per frame of what the braille renderer would have sent a terminal.
+ * It plays back in any terminal with `asciinema play`, embeds anywhere the
+ * player does, and a five second flock is a few hundred kilobytes where the
+ * GIF of it is five megabytes — because only the cells that changed are in it.
+ */
+static int run_cast_recording(void) {
+    spatial_grid_t grid;
+    settle_the_recording_length();
+    int total = record_fps * record_seconds;
+    settle_the_palette_without_a_terminal();
+    set_frame_seconds(1.0 / record_fps);
+    legend_enabled = 0;
+    render_mode = RENDER_BRAILLE;
+    apply_screen_size(record_columns, record_rows, record_columns * DEFAULT_CELL_WIDTH,
+                      record_rows * DEFAULT_CELL_HEIGHT);
+    settle_the_bird_size();
+    if (spatial_grid_init(&grid, SPATIAL_CELL_SIZE) != SPATIAL_GRID_OK) return EXIT_FAILURE;
+    if (spatial_grid_prepare(&grid, screen.width, screen.height, config.birds) != SPATIAL_GRID_OK)
+        return EXIT_FAILURE;
+    if (!prepare_text_renderer() || !text_renderer_fits_the_screen()) {
+        fprintf(stderr, "%s: cannot build the sprites to record with\n", program_name);
+        return EXIT_FAILURE;
+    }
+    /* A cast is played in somebody else's terminal, whose colours are unknown:
+     * 24 bit colour is what every player of casts understands. */
+    text_cells.truecolor = 1;
+
+    bird_t *birds = calloc((size_t)config.birds, sizeof(*birds));
+    bird_t *snapshot = malloc(sizeof(*snapshot) * (size_t)config.birds);
+    FILE *out = birds != NULL && snapshot != NULL ? fopen(record_path, "w") : NULL;
+    if (out == NULL) {
+        if (birds != NULL && snapshot != NULL)
+            fprintf(stderr, "%s: %s: %s\n", program_name, record_path, strerror(errno));
+        free(birds);
+        free(snapshot);
+        return EXIT_FAILURE;
+    }
+    fprintf(out,
+            "{\"version\": 2, \"width\": %d, \"height\": %d, \"timestamp\": %ld, "
+            "\"title\": \"cbirds\", \"env\": {\"TERM\": \"xterm-256color\", \"SHELL\": "
+            "\"/bin/sh\"}}\n",
+            screen.cols, screen.rows, (long)time(NULL));
+    seed_random(requested_seed >= 0 ? (unsigned)requested_seed : 1u);
+    initialize_birds(birds);
+    place_hawks();
+    begin_the_intro();
+
+    /* Hidden cursor and a clean slate first; the pen put back at the end. */
+    static const char opening[] = "\033[?25l\033[2J";
+    fprintf(out, "[0, \"o\", ");
+    write_json_string(out, opening, sizeof(opening) - 1);
+    fprintf(out, "]\n");
+
+    long bytes = 0;
+    for (int frame = 0; frame < total; frame++) {
+        clock_state.frame = frame;
+        clock_state.seconds = (double)frame / record_fps;
+        if (formation.writing && formation.until >= 0 && clock_state.seconds >= formation.until)
+            formation_clear();
+        sign_advance(birds);
+        maybe_drift();
+        hold_the_last_rest((double)(total - frame) / record_fps);
+
+        memcpy(snapshot, birds, sizeof(*birds) * (size_t)config.birds);
+        spatial_grid_build(&grid, config.birds, read_bird_position, snapshot);
+        fly(birds, snapshot, &grid);
+
+        if (letters_mode) {
+            paint_the_letters(birds);
+        } else {
+            compose_onto(&text_canvas, text_sprites, birds, 0);
+            cells_read(&text_cells, CELLS_BRAILLE, &text_canvas, screen.cell_width,
+                       screen.cell_height);
+            colour_the_hawks_in(&text_cells, text_sprites);
+        }
+        if (cells_emit(&text_cells) != CELLS_OK) break;
+        /* Inside a synchronized update, for the players that honour it. */
+        fprintf(out, "[%.4f, \"o\", ", clock_state.seconds);
+        fputs("\"\\u001b[?2026h", out);
+        for (size_t i = 0; i < text_cells.length; i++) {
+            unsigned char c = (unsigned char)text_cells.text[i];
+            if (c == '"' || c == '\\')
+                fprintf(out, "\\%c", c);
+            else if (c < 0x20)
+                fprintf(out, "\\u%04x", c);
+            else
+                fputc(c, out);
+        }
+        fputs("\\u001b[?2026l\"]\n", out);
+        bytes += (long)text_cells.length;
+    }
+    static const char closing[] = "\033[0m\033[?25h";
+    fprintf(out, "[%.4f, \"o\", ", (double)total / record_fps);
+    write_json_string(out, closing, sizeof(closing) - 1);
+    fprintf(out, "]\n");
+    int closed = fclose(out) == 0;
+    formation_clear(); /* A clip shorter than the intro would leave it writing. */
+
+    cells_destroy(&text_cells);
+    png_image_free(&text_canvas);
+    free_sprites(text_sprites);
+    spatial_grid_destroy(&grid);
+    letters_destroy(&the_letters);
+    forget_the_text();
+    end_the_sky();
+    free(snapshot);
+    free(birds);
+    if (!closed) {
+        fprintf(stderr, "%s: %s: %s\n", program_name, record_path, strerror(errno));
+        return EXIT_FAILURE;
+    }
+    printf("%s: %d frames, %dx%d cells, %d fps, %.1fs, %.1f KB of %s\n", record_path, total,
+           screen.cols, screen.rows, record_fps, (double)total / record_fps, (double)bytes / 1024.0,
+           letters_mode ? "text" : "braille");
+    sign_report_failure();
+    return EXIT_SUCCESS;
+}
+
+/* Ascending by the bucket gif.c counts a colour in, five bits a channel. */
+static int by_gif_bucket(const void *a, const void *b) {
+    const uint8_t *x = a, *y = b;
+    for (int c = 0; c < 3; c++)
+        if ((x[c] >> 3) != (y[c] >> 3)) return (x[c] >> 3) - (y[c] >> 3);
+    return 0;
+}
+
+/* A recording's table of colours is made from its first frame, and in a space the
+ * first frame does not show everything: a size of bird nobody has flown into view
+ * yet, or a hawk that is still off the screen, would be drawn in the nearest colour
+ * the table has. The colours that matter are the flat tints of the sprites, each
+ * a handful, and they are asked for by name, in the order of their buckets, so
+ * that the table does not depend on how the sets are numbered. The flat flock
+ * shows everything it has from the first frame, and is left as it was. */
+static void reserve_the_colours_of_the_sprites(gif_writer_t *gif, const png_image_t *frames) {
+    uint8_t colours[GIF_RESERVED_MAX][3];
+    int count = 0;
+    for (int set = 0; set < sprite_set_count() && count < GIF_RESERVED_MAX; set++) {
+        const png_image_t *image = &frames[set * ROTATION_FRAMES];
+        if (image->pixels == NULL) continue;
+        for (int i = 0; i < image->width * image->height; i++) {
+            const uint8_t *pixel = image->pixels + (size_t)i * 4;
+            if (pixel[3] != 255) continue;
+            int known = 0;
+            for (int c = 0; c < count; c++) known |= memcmp(colours[c], pixel, 3) == 0;
+            if (!known) memcpy(colours[count++], pixel, 3);
+            break;
+        }
+    }
+    qsort(colours, (size_t)count, sizeof(*colours), by_gif_bucket);
+    gif_reserve_colours(gif, (const uint8_t(*)[3])colours, count);
+}
+
+static int run_recording(void) {
+    static png_image_t frames[ROTATION_FRAMES * MAX_SPRITE_SETS];
+    png_image_t canvas = {0, 0, NULL};
+    spatial_grid_t grid;
+    gif_writer_t *gif = NULL;
+    size_t bytes = 0;
+    int written = 0;
+    /* The name says which: a .cast is text, anything else is a GIF. */
+    size_t name_length = strlen(record_path);
+    if (name_length > 5 && strcmp(record_path + name_length - 5, ".cast") == 0)
+        return run_cast_recording();
+    /* The delay is whole hundredths, so the rate asked for is rounded to one the
+     * format can carry and the rate actually achieved is reported rather than
+     * claimed. Every simulated frame is recorded, and the simulation steps at the
+     * recording rate, so the motion in the GIF runs at life speed. */
+    settle_the_palette_without_a_terminal();
+    settle_the_recording_length();
+    int delay = record_delay_for(record_fps);
+    /* The rate a hundredth-of-a-second delay really gives, which is not always a
+     * whole number: a delay of 17 plays at 5.88 a second, not 5. */
+    double actual_fps = 100.0 / delay;
+    /* Counted on that rate, so --record-seconds means the seconds it lasts rather
+     * than the seconds it was meant to. */
+    int total = (int)(actual_fps * record_seconds + 0.5);
+
+    /* A recording advances on its encoded clock rather than wall time, so it is
+     * reproducible no matter how long a frame takes to produce. */
+    set_frame_seconds(1.0 / actual_fps);
+
+    /* A GIF has no panel in it: the panel is terminal text, and compose() draws
+     * birds. Left enabled it would still reserve its corner and keep the flock
+     * out of it, and every recording would have an unexplained empty rectangle in
+     * the top left. */
+    legend_enabled = 0;
+    apply_screen_size(record_columns, record_rows, record_columns * DEFAULT_CELL_WIDTH,
+                      record_rows * DEFAULT_CELL_HEIGHT);
+    if (spatial_grid_init(&grid, SPATIAL_CELL_SIZE) != SPATIAL_GRID_OK) return EXIT_FAILURE;
+    if (spatial_grid_prepare(&grid, screen.width, screen.height, config.birds) != SPATIAL_GRID_OK)
+        return EXIT_FAILURE;
+    if (!letters_mode && rasterise_sprites(frames) != PNG_OK) {
+        fprintf(stderr, "%s: cannot build the sprites to record with\n", program_name);
+        return EXIT_FAILURE;
+    }
+    if (png_image_alloc(&canvas, screen.width, screen.height) != PNG_OK) return EXIT_FAILURE;
+    /* Under --render braille, sextants or blocks the GIF is of the cells, painted
+     * the way a text terminal shows them, because a GIF of the pixels the cells
+     * were read from would be a picture of something nobody saw. Text is always
+     * that: it is drawn with the font, in cells of a size the font reads at. */
+    int as_text = letters_mode || drawing_with_text();
+    png_image_t painted = {0, 0, NULL};
+    int picture_cell_width = letters_mode ? LETTER_PICTURE_WIDTH : screen.cell_width;
+    int picture_cell_height = letters_mode ? LETTER_PICTURE_HEIGHT : screen.cell_height;
+    if (as_text && (cells_init(&text_cells, 1) != CELLS_OK ||
+                    cells_resize(&text_cells, screen.cols, screen.rows) != CELLS_OK))
+        return EXIT_FAILURE;
+
+    gif_status_t gif_status =
+        gif_open(&gif, record_path, as_text ? screen.cols * picture_cell_width : screen.width,
+                 as_text ? screen.rows * picture_cell_height : screen.height, delay);
+    if (gif_status != GIF_OK) {
+        fprintf(stderr, "%s: %s: %s\n", program_name, record_path, gif_status_string(gif_status));
+        return EXIT_FAILURE;
+    }
+    if (sky_mode) reserve_the_colours_of_the_sprites(gif, frames);
+
+    /* The first frame is the text at rest, which is where the table is chosen: the
+     * colours the letters will fly in are promised to it. */
+    if (letters_mode) {
+        uint8_t flying[GIF_SEEDS * 3];
+        int colours = 0;
+        for (int shade = 0; shade < palette()->shades && colours < GIF_SEEDS - 1;
+             shade++, colours++)
+            memcpy(flying + colours * 3, palette()->tints[shade], 3);
+        if (config.hawks > 0) memcpy(flying + 3 * colours++, hawk_colour(), 3);
+        gif_hint_colours(gif, flying, colours);
+    }
+
+    bird_t *birds = calloc((size_t)config.birds, sizeof(*birds));
+    bird_t *snapshot = malloc(sizeof(*snapshot) * (size_t)config.birds);
+    if (birds == NULL || snapshot == NULL) return EXIT_FAILURE;
+    seed_random(requested_seed >= 0 ? (unsigned)requested_seed : 1u);
+    initialize_birds(birds);
+    place_hawks();
+    begin_the_intro();
+
+    for (int frame = 0; frame < total && gif_status == GIF_OK; frame++) {
+        /* The clock the features read has to advance, or nothing that animates
+         * on its own terms would animate at all. */
+        clock_state.frame = frame;
+        clock_state.seconds = (double)frame / actual_fps;
+        if (formation.writing && formation.until >= 0 && clock_state.seconds >= formation.until)
+            formation_clear();
+        sign_advance(birds);
+        maybe_drift();
+        hold_the_last_rest((double)(total - frame) / actual_fps);
+
+        memcpy(snapshot, birds, sizeof(*birds) * (size_t)config.birds);
+        spatial_grid_build(&grid, config.birds, read_bird_position, snapshot);
+        fly(birds, snapshot, &grid);
+
+        if (as_text) {
+            if (letters_mode) {
+                paint_the_letters(birds);
+            } else {
+                compose_onto(&canvas, frames, birds, 0);
+                cells_read(&text_cells, text_style(), &canvas, screen.cell_width,
+                           screen.cell_height);
+                colour_the_hawks_in(&text_cells, frames);
+            }
+            png_image_free(&painted);
+            if (cells_emit(&text_cells) != CELLS_OK ||
+                cells_paint(&text_cells, letters_mode ? CELLS_TEXT : text_style(), &painted,
+                            picture_cell_width, picture_cell_height,
+                            picture_ground()) != CELLS_OK) {
+                gif_status = GIF_ERR_MEMORY;
+                break;
+            }
+            gif_status = gif_add_frame(gif, &painted);
+        } else {
+            compose_onto(&canvas, frames, birds, 1);
+            gif_status = gif_add_frame(gif, &canvas);
+        }
+    }
+    formation_clear();
+
+    gif_status_t closed = gif_close(gif, &bytes, &written);
+    if (gif_status == GIF_OK) gif_status = closed;
+    free_sprites(frames);
+    png_image_free(&canvas);
+    png_image_free(&painted);
+    if (as_text) cells_destroy(&text_cells);
+    spatial_grid_destroy(&grid);
+    letters_destroy(&the_letters);
+    forget_the_text();
+    end_the_sky();
+    free(snapshot);
+    free(birds);
+
+    if (gif_status != GIF_OK) {
+        fprintf(stderr, "%s: %s: %s\n", program_name, record_path, gif_status_string(gif_status));
+        return EXIT_FAILURE;
+    }
+    printf("%s: %d frames, %dx%d, %.4g fps, %.1fs, %.1f KB\n", record_path, written,
+           as_text ? screen.cols * picture_cell_width : screen.width,
+           as_text ? screen.rows * picture_cell_height : screen.height, actual_fps,
+           written / actual_fps, (double)bytes / 1024.0);
+    if (delay != record_delay_for(record_fps) || (int)(actual_fps + 0.5) != record_fps)
+        fprintf(stderr,
+                "%s: asked for %d fps, recorded at %.4g. A GIF's delay between frames is\n"
+                "whole hundredths of a second, so the only rates it has are 100/1, 100/2,\n"
+                "100/3 and so on, and viewers clamp anything under two hundredths up to a\n"
+                "tenth. %.4g is the nearest rate this format can actually carry.\n",
+                program_name, record_fps, actual_fps, actual_fps);
+    sign_report_failure();
+    return EXIT_SUCCESS;
+}
+
+static int run_benchmark(void) {
+    kitty_graphics_t graphics;
+    spatial_grid_t grid;
+    struct timespec start, finish;
+
+    settle_the_palette_without_a_terminal();
+    apply_screen_size(200, 50, 1600, 800);
+    /* There is no terminal, so unasked means the sprites, as in a recording; any
+     * other renderer is measured as asked for, sprites built the way it builds
+     * them. */
+    if (render_mode == RENDER_UNSET) render_mode = RENDER_KITTY;
+    if (letters_mode) render_mode = RENDER_BRAILLE; /* Letters are text. */
+    settle_the_bird_size();
+    if (drawing_with_text() && !prepare_text_renderer()) return EXIT_FAILURE;
+    set_frame_seconds(1.0 / FRAME_RATE);
+    if (spatial_grid_init(&grid, SPATIAL_CELL_SIZE) != SPATIAL_GRID_OK) return EXIT_FAILURE;
+    if (spatial_grid_prepare(&grid, screen.width, screen.height, config.birds) != SPATIAL_GRID_OK)
+        return EXIT_FAILURE;
+    if (kitty_graphics_init(&graphics, STDOUT_FILENO) != KITTY_GRAPHICS_OK) return EXIT_FAILURE;
+
+    bird_t *birds = calloc((size_t)config.birds, sizeof(*birds));
+    bird_t *snapshot = malloc(sizeof(*snapshot) * (size_t)config.birds);
+    if (birds == NULL || snapshot == NULL) return EXIT_FAILURE;
+    seed_random(requested_seed >= 0 ? (unsigned)requested_seed : 1u);
+    initialize_birds(birds);
+    place_hawks();
+    /* The default bench has never written anything, and still does not; a sign
+     * is measured with the clock it would have at sixty frames a second. */
+    if (a_sign_is_asked_for()) begin_the_intro();
+    /* Text at rest costs nothing, which is not what anybody wants to know: the wave
+     * is started at once, and the frames are those of a flock in the air. */
+    if (letters_mode) letters_poke(&the_letters);
+
+    double bytes = 0;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (int frame = 0; frame < bench_frames; frame++) {
+        if (a_sign_is_asked_for()) {
+            clock_state.seconds = (double)frame / FRAME_RATE;
+            sign_advance(birds);
+        }
+        memcpy(snapshot, birds, sizeof(*birds) * (size_t)config.birds);
+        spatial_grid_build(&grid, config.birds, read_bird_position, snapshot);
+        hunt(snapshot);
+        graphics.length = 0;
+        render_frame(&graphics, birds, snapshot, &grid);
+        bytes += (double)graphics.length;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &finish);
+
+    double seconds =
+        (double)(finish.tv_sec - start.tv_sec) + (double)(finish.tv_nsec - start.tv_nsec) / 1e9;
+    double per_frame = seconds / bench_frames;
+    printf("birds        %d\n", config.birds);
+    if (letters_mode)
+        printf("letters      %d of %d glyphs\n", the_letters.count, the_letters.cells_with_glyphs);
+    printf("flocks       %d\n", config.flocks);
+    printf("hawks        %d\n", config.hawks);
+    printf("viewport     %dx%d px\n", screen.width, screen.height);
+    printf("render       %s\n", RENDER_NAMES[render_mode]);
+    printf("frames       %d\n", bench_frames);
+    printf("frame time   %.3f ms\n", per_frame * 1000.0);
+    printf("ceiling      %.0f fps\n", 1.0 / per_frame);
+    printf("bytes/frame  %.0f (%.1f KB)\n", bytes / bench_frames, bytes / bench_frames / 1024.0);
+    printf("at %d fps    %.1f MB/s\n", FRAME_RATE, bytes / bench_frames * FRAME_RATE / 1e6);
+    sign_report_failure();
+
+    kitty_graphics_destroy(&graphics);
+    spatial_grid_destroy(&grid);
+    /* The text renderer's cells and canvas, which the frames grew to the screen. */
+    cells_destroy(&text_cells);
+    png_image_free(&text_canvas);
+    letters_destroy(&the_letters);
+    forget_the_text();
+    end_the_sky();
+    free(snapshot);
+    free(birds);
+    return EXIT_SUCCESS;
+}
+
+int main(int argc, char **argv) {
+    kitty_graphics_t graphics;
+    spatial_grid_t grid;
+    struct timespec frame_start, frame_end, launched;
+    clock_gettime(CLOCK_MONOTONIC, &launched);
+    read_options(argc, argv);
+    trig_lookup_init();
+    if (bench_frames > 0) {
+        /* A benchmark reads a file it is named, never a pipe it happens to be in. */
+        take_the_text(200, 50, 0);
+        return run_benchmark();
+    }
+    if (record_path != NULL) {
+        take_the_text(record_columns, record_rows, 1);
+        return run_recording();
+    }
+    install_signal_handlers();
+    atexit(restore_terminal);
+
+    /* The keys, and then the text, before the terminal is taken: the text is laid
+     * out on a screen of the size this one is, and reading it may take a moment. */
+    /* A file that is not there is said first: it is the mistake, and the keys are not. */
+    if (text_path != NULL && strcmp(text_path, "-") != 0) text_fd = open_the_text_file();
+    open_the_keys();
+    update_screen_dimensions();
+    take_the_text(screen.cols, screen.rows, 1);
+    /* After everything that can refuse the run, so that a run that is refused has
+     * been in nobody's sky, and before the terminal is taken, so that what it says
+     * when it cannot join is read where it is written. */
+    sky_join();
+
+    /* The terminal is asked its questions before anything is built for it: can
+     * you draw this at all, and what colours do you use? The sprites are then
+     * built once, in the answers. */
+    if (enter_terminal() < 0) {
+        perror("Can't enable raw mode");
+        exit(EXIT_FAILURE);
+    }
+    /* Braille in every terminal, and the sprites when --render kitty asks: there
+     * is no terminal this refuses to run in, and none it has to guess about. */
+    render_mode = live_render_mode();
+    if (palette_follows_the_theme() && !learn_the_theme()) config.palette = FALLBACK_PALETTE;
+    if (palette_is_ink() && !learn_the_ink(sky_mode ? SKY_DIM : FAR_DIM))
+        config.palette = FALLBACK_INK;
+
+    spatial_grid_status_t grid_status = spatial_grid_init(&grid, SPATIAL_CELL_SIZE);
+    if (grid_status != SPATIAL_GRID_OK)
+        leave_saying("Cannot initialize spatial grid: %s\n",
+                     spatial_grid_status_string(grid_status));
+    /* A named seed makes a run repeatable, which is what lets a look be shared
+     * and a bug report be reproduced. */
+    seed_random(requested_seed >= 0 ? (unsigned)requested_seed : (unsigned)time(NULL));
+    update_screen_dimensions();
+    settle_the_bird_size(); /* From the screen, if it is a sign that is being sized. */
+    grid_status = spatial_grid_prepare(&grid, screen.width, screen.height, config.birds);
+    if (grid_status != SPATIAL_GRID_OK)
+        leave_saying("Cannot prepare spatial grid: %s\n", spatial_grid_status_string(grid_status));
+    /* The sprites, once, as pixels: the text renderers read them back as cells
+     * every frame, and Kitty is sent them encoded and then places them by id. */
+    if (drawing_with_text()) {
+        if (!prepare_text_renderer())
+            leave_saying("%s: cannot build the sprites to draw with\n", program_name);
+    } else if (rasterise_sprites(text_sprites) != PNG_OK) {
+        leave_saying("%s: cannot build the sprites to draw with\n", program_name);
+    }
+    set_frame_seconds(1.0 / FRAME_RATE);
+    hawk_sets_built = 1;
+
+    bird_t *birds = calloc((size_t)bird_room(config.birds), sizeof(*birds));
+    bird_t *snapshot = malloc(sizeof(*snapshot) * (size_t)bird_room(config.birds));
+    if (!birds || !snapshot) leave_saying("Out of memory: %s\n", strerror(errno));
+    kitty_graphics_status_t graphics_status = kitty_graphics_init(&graphics, STDOUT_FILENO);
+    if (graphics_status != KITTY_GRAPHICS_OK)
+        leave_saying("Cannot initialize Kitty graphics: %s\n",
+                     kitty_graphics_status_string(graphics_status));
+
+    enter_alt_screen();
+    write_all("\x1b[J", sizeof("\x1b[J") - 1);
+    update_screen_dimensions();
+    initialize_birds(birds);
+    place_hawks();
+    begin_the_intro();
+    if (render_mode == RENDER_KITTY) {
+        sprites_uploaded = 1; /* Even a failed upload may have left some behind. */
+        graphics_status = upload_sprite_sets(&graphics, text_sprites);
+        free_sprites(text_sprites);
+        if (graphics_status != KITTY_GRAPHICS_OK)
+            leave_saying("Cannot upload Kitty graphics: %s\n",
+                         kitty_graphics_status_string(graphics_status));
+    }
+
+    struct timespec started;
+    clock_gettime(CLOCK_MONOTONIC, &started);
+    launch_lag = elapsed_seconds(&launched, &started);
+    struct timespec previous_frame = started;
+    int live_birds = config.birds;
+    int running = 1;
+    double leaving = 0; /* Seconds left of the flight out. */
+    while (running) {
+        if (!handle_input() && leaving <= 0) {
+            /* A screensaver is gone the moment it is asked, with no flight out: the
+             * person at the keyboard is waiting for the shell. */
+            if (screensaver_mode) break;
+            /* Asked to quit: fly off the top first, so the last thing seen is
+             * the flock leaving rather than the screen blinking out. */
+            leaving = (double)OUTRO_FRAMES_AT_SIXTY / FRAME_RATE;
+            formation_clear();
+            sky_leave(); /* Its neighbours need not wait for the flock to be gone. */
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &frame_start);
+        set_frame_seconds(live_frame_seconds(elapsed_seconds(&previous_frame, &frame_start)));
+        previous_frame = frame_start;
+        if (leaving > 0) {
+            leaving -= frame_seconds;
+            if (leaving <= 0) break;
+        }
+        clock_state.frame++;
+        clock_state.seconds = (double)(frame_start.tv_sec - started.tv_sec) +
+                              (double)(frame_start.tv_nsec - started.tv_nsec) / 1e9;
+        /* Writing lets go when its hold is up, and the flock takes over again
+         * from wherever the letters left it, which is the nicest part to watch. */
+        if (formation.writing && formation.until >= 0 && clock_state.seconds >= formation.until)
+            formation_clear();
+        maybe_drift();
+        update_screen_dimensions();
+        if (reflow_the_letters(&birds, &snapshot)) live_birds = config.birds;
+        sprite_fit_t fit = fit_the_sprites_to_the_window(&graphics);
+        if (fit == SPRITES_FAILED)
+            leave_saying("%s: cannot build the sprites to draw with\n", program_name);
+        /* The pause was building, not flying: the next frame is one frame long. */
+        if (fit == SPRITES_REBUILT) clock_gettime(CLOCK_MONOTONIC, &previous_frame);
+        grid_status = spatial_grid_prepare(&grid, screen.width, screen.height, grid_items());
+        if (grid_status != SPATIAL_GRID_OK)
+            leave_saying("Cannot resize spatial grid: %s\n",
+                         spatial_grid_status_string(grid_status));
+        if (population_changed) {
+            /* Grown or shrunk by a keypress, and the grid needs room for them. */
+            population_changed = 0;
+            if (resize_the_flock(&birds, &snapshot, live_birds, config.birds))
+                live_birds = config.birds;
+            else
+                config.birds = live_birds; /* Keep what we have rather than lose it. */
+            grid_status = spatial_grid_prepare(&grid, screen.width, screen.height, grid_items());
+            if (grid_status != SPATIAL_GRID_OK)
+                leave_saying("Cannot resize spatial grid: %s\n",
+                             spatial_grid_status_string(grid_status));
+        }
+        if (the_row.opened) {
+            /* The birds that have come in, after the keys have had their say about
+             * how many there are, and before the grid is built from all of them. */
+            sky_keep_up();
+            sky_take_in(birds, &live_birds);
+            grid_status = spatial_grid_prepare(&grid, screen.width, screen.height, grid_items());
+            if (grid_status != SPATIAL_GRID_OK)
+                leave_saying("Cannot resize spatial grid: %s\n",
+                             spatial_grid_status_string(grid_status));
+        }
+        /* After the flock has the size it is to have, and after the screen is
+         * measured: a sign is laid out for both, and reads every bird of it. */
+        if (leaving <= 0) sign_advance(birds);
+        memcpy(snapshot, birds, sizeof(*birds) * (size_t)config.birds);
+        grid_status = spatial_grid_build(&grid, config.birds, read_bird_position, snapshot);
+        if (grid_status != SPATIAL_GRID_OK)
+            leave_saying("Cannot build spatial grid: %s\n",
+                         spatial_grid_status_string(grid_status));
+        if (leaving > 0) fly_away(birds);
+        graphics_status = leaving > 0 ? queue_render_frame(&graphics, birds)
+                                      : render_frame(&graphics, birds, snapshot, &grid);
+        if (graphics_status != KITTY_GRAPHICS_OK)
+            leave_saying("Cannot render Kitty graphics: %s\n",
+                         kitty_graphics_status_string(graphics_status));
+        if (leaving <= 0) sky_hand_over(birds, &live_birds);
+        size_t frame_bytes = graphics.length;
+        while (running && graphics.length > 0) {
+            graphics_status = kitty_graphics_flush_nonblocking(&graphics);
+            if (graphics_status == KITTY_GRAPHICS_AGAIN) {
+                if (wait_for_terminal_io() < 0)
+                    leave_saying("Cannot wait for terminal output: %s\n", strerror(errno));
+                running = handle_input();
+                continue;
+            }
+            if (graphics_status != KITTY_GRAPHICS_OK) {
+                /* Whatever the renderer: the text ones go through this buffer
+                 * too, and a reader that went away is the usual reason. */
+                leave_saying("%s: cannot write to the terminal: %s\n", program_name,
+                             graphics_status == KITTY_GRAPHICS_ERR_IO
+                                 ? strerror(errno)
+                                 : kitty_graphics_status_string(graphics_status));
+            }
+        }
+        if (!running) break;
+        if (frame_limit > 0 && clock_state.frame >= frame_limit) break;
+        clock_gettime(CLOCK_MONOTONIC, &frame_end);
+        /* Averaged over a second, because a number that changes sixty times a
+         * second is decoration rather than information. */
+        stats.window_ms += (double)elapsed_microseconds(&frame_start, &frame_end) / 1000.0;
+        stats.window_bytes += (double)frame_bytes;
+        stats.counted++;
+        if (clock_state.seconds - stats.window_started >= 1.0) {
+            double span = clock_state.seconds - stats.window_started;
+            stats.frame_ms = stats.window_ms / (double)stats.counted;
+            stats.bytes = stats.window_bytes / (double)stats.counted;
+            stats.rate = (double)stats.counted / span;
+            stats.window_started = clock_state.seconds;
+            stats.window_ms = stats.window_bytes = 0;
+            stats.counted = 0;
+        }
+        long remaining = frame_delay_after(elapsed_microseconds(&frame_start, &frame_end));
+        if (remaining > 0) {
+            struct timespec delay = {remaining / 1000000L, (remaining % 1000000L) * 1000L};
+            nanosleep(&delay, NULL);
+        }
+    }
+    /* The terminal is back before anything is said to the person at it: why a sign
+     * could not be laid out, and what came of a snapshot. On the alternate screen,
+     * with output processing off, it would be thrown away with the screen. */
+    if (the_sign.failures > 0 || snapshot_path != NULL) restore_terminal();
+    sign_report_failure();
+    /* A snapshot asked for and not written is a failed run, so a script that
+     * takes one can tell. */
+    int outcome = EXIT_SUCCESS;
+    if (snapshot_path != NULL) {
+        if (write_snapshot(snapshot_path, birds)) {
+            fprintf(stderr, "%s: wrote %s\n", program_name, snapshot_path);
+        } else {
+            fprintf(stderr, "%s: could not write %s\n", program_name, snapshot_path);
+            outcome = EXIT_FAILURE;
+        }
+    }
+    sky_leave();
+    spatial_grid_destroy(&grid);
+    kitty_graphics_destroy(&graphics);
+    letters_destroy(&the_letters);
+    forget_the_text();
+    end_the_sky();
+    free(snapshot);
+    free(birds);
+    return outcome;
+}

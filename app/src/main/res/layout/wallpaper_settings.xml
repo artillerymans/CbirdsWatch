@@ -1,0 +1,81 @@
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center"
+        android:orientation="vertical"
+        android:padding="24dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:accessibilityHeading="true"
+            android:fontFamily="sans-serif-medium"
+            android:gravity="center"
+            android:text="@string/wallpaper_settings_title"
+            android:textColor="?android:attr/textColorPrimary"
+            android:textSize="24sp" />
+
+        <ImageView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:adjustViewBounds="true"
+            android:importantForAccessibility="no"
+            android:maxWidth="184dp"
+            android:maxHeight="184dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/cbirds_wallpaper_thumbnail" />
+
+        <TextView
+            android:id="@+id/bird_count_label"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:labelFor="@id/bird_count_slider"
+            android:textSize="16sp" />
+
+        <SeekBar
+            android:id="@+id/bird_count_slider"
+            android:layout_width="match_parent"
+            android:layout_height="48dp" />
+
+        <TextView
+            android:id="@+id/flight_speed_label"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:labelFor="@id/flight_speed_slider"
+            android:textSize="16sp" />
+
+        <SeekBar
+            android:id="@+id/flight_speed_slider"
+            android:layout_width="match_parent"
+            android:layout_height="48dp" />
+
+        <TextView
+            android:id="@+id/wallpaper_status"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:accessibilityLiveRegion="polite"
+            android:gravity="center"
+            android:textColor="?android:attr/textColorSecondary"
+            android:textSize="16sp" />
+
+        <Button
+            android:id="@+id/wallpaper_action"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:minHeight="48dp"
+            android:paddingStart="20dp"
+            android:paddingEnd="20dp"
+            android:backgroundTint="?android:attr/colorAccent"
+            android:textAllCaps="false"
+            android:textColor="#211507" />
+    </LinearLayout>
+</ScrollView>

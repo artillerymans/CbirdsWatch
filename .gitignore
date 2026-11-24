@@ -1,0 +1,24 @@
+.gradle/
+.idea/
+.cxx/
+build/
+*.iml
+
+# Local configuration and signing keys
+local.properties
+keystore.properties
+signing.properties
+*.jks
+*.keystore
+*.jceks
+*.bks
+*.p12
+*.pfx
+*.pk8
+*.pem
+*.key
+
+# Android packages
+*.apk
+*.aab
+*.apks
