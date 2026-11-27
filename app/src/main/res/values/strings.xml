@@ -9,4 +9,11 @@
     <string name="change_wallpaper">更换壁纸</string>
     <string name="wallpaper_change_blocked">此设备不允许更换壁纸</string>
     <string name="wallpaper_picker_unavailable">无法打开系统壁纸选择器</string>
+    <string name="wallpaper_applying">正在设置…</string>
+    <string name="wallpaper_direct_unsupported">直接设置适用于 Android 9 的主用户。</string>
+    <string name="wallpaper_shizuku_start">请启动或更新 Shizuku，再回来重试。</string>
+    <string name="wallpaper_shizuku_authorize">请在 Shizuku 中授权 cbirds Clock，再回来点击「设为默认表盘」。</string>
+    <string name="wallpaper_shizuku_root">当前 Shizuku 缺少设置动态壁纸的系统权限。请以 Root 模式启动 Shizuku。</string>
+    <string name="wallpaper_shizuku_denied">系统拒绝设置壁纸。请检查 Shizuku 授权和启动模式。</string>
+    <string name="wallpaper_direct_failed">未能设置动态壁纸。请检查 Shizuku 是否正在运行后重试。</string>
 </resources>

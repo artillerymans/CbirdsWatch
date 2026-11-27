@@ -1,8 +1,8 @@
 <resources>
     <style name="WallpaperSettingsTheme" parent="android:style/Theme.Material.NoActionBar">
-        <item name="android:windowBackground">#121218</item>
-        <item name="android:statusBarColor">#121218</item>
-        <item name="android:navigationBarColor">#121218</item>
-        <item name="android:colorAccent">#FFBF69</item>
+        <item name="android:windowBackground">@color/wallpaper_background</item>
+        <item name="android:statusBarColor">@color/wallpaper_background</item>
+        <item name="android:navigationBarColor">@color/wallpaper_background</item>
+        <item name="android:colorAccent">@color/wallpaper_accent</item>
     </style>
 </resources>

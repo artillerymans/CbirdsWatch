@@ -15,4 +15,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = 'CbirdsWatch'
-include ':app'
+include ':app', ':dwplugin'

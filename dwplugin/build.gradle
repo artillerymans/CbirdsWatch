@@ -1,0 +1,79 @@
+plugins {
+    id 'com.android.application' version '8.12.3'
+}
+
+android {
+    namespace 'com.artillery.cbirds.dw'
+    compileSdk 35
+    ndkVersion '30.0.16248370'
+
+    defaultConfig {
+        applicationId 'com.artillery.cbirds.dw'
+        minSdk 28
+        targetSdk 28
+        versionCode 1
+        versionName '0.1.0'
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    packaging {
+        jniLibs.useLegacyPackaging = true
+    }
+
+    lint {
+        // Sideloaded onto the Android 9 watch, matching the wallpaper module.
+        warning.add('ExpiredTargetSdkVersion')
+    }
+}
+
+// Use libraries placed and labelled by Android's package installer.
+def generatedNativeLibraries = layout.buildDirectory.dir('generated/cbirdsJniLibs')
+def nativeAbis = providers.gradleProperty('dwNativeAbis')
+        .orElse('armeabi-v7a,arm64-v8a').get().split(',').collect { it.trim() }
+def sdkDirectory = android.sdkDirectory
+def cmakeDirectory = new File(sdkDirectory, 'cmake/4.1.2/bin')
+def ndkDirectory = new File(sdkDirectory, 'ndk/30.0.16248370')
+
+def buildDwNative = tasks.register('buildDwNative') {
+    inputs.dir('src/main/cpp')
+    inputs.dir('../app/src/main/cpp')
+    inputs.property('abis', nativeAbis)
+    outputs.dir(generatedNativeLibraries)
+
+    doLast {
+        nativeAbis.each { abi ->
+            def nativeBuild = layout.buildDirectory.dir("cbirdsNative/${abi}").get().asFile
+            exec {
+                commandLine new File(cmakeDirectory, 'cmake'),
+                        '-S', file('src/main/cpp'), '-B', nativeBuild,
+                        '-G', 'Ninja',
+                        "-DCMAKE_MAKE_PROGRAM=${new File(cmakeDirectory, 'ninja')}",
+                        "-DCMAKE_TOOLCHAIN_FILE=${new File(ndkDirectory, 'build/cmake/android.toolchain.cmake')}",
+                        "-DANDROID_ABI=${abi}", '-DANDROID_PLATFORM=android-28',
+                        '-DCMAKE_BUILD_TYPE=Release'
+            }
+            exec {
+                commandLine new File(cmakeDirectory, 'cmake'), '--build', nativeBuild,
+                        '--target', 'cbirds_dw', '--parallel', '4'
+            }
+            copy {
+                from new File(nativeBuild, 'libcbirds_dw.so')
+                into generatedNativeLibraries.get().dir(abi)
+            }
+        }
+    }
+}
+
+android.sourceSets.main.jniLibs.srcDir(generatedNativeLibraries)
+tasks.named('preBuild').configure { dependsOn(buildDwNative) }

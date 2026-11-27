@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<DialConfs>
+    <DialConf>
+        <id>900001</id>
+        <name>鸟群时钟</name>
+        <name_en>Cbirds Clock</name_en>
+        <bg_type>1</bg_type>
+        <editable>0</editable>
+    </DialConf>
+</DialConfs>

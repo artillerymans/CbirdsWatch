@@ -1,0 +1,6 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Loaded by DW's DexClassLoader; no Activity or WallpaperService needed. -->
+    <application android:allowBackup="false" android:label="Cbirds DW"
+        android:icon="@drawable/cbirds_icon"
+        android:extractNativeLibs="true" />
+</manifest>
